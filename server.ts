@@ -2612,8 +2612,9 @@ Cloud Platform Service | Tech: React, Node.js, MongoDB`;
       details: process.env.NODE_ENV !== "production" ? err.stack : undefined
     });
   });
-  // Vite middleware for development
-  if (process.env.NODE_ENV !== "production") {
+  // Vite middleware for development (Only if index.html exists, meaning we have frontend source files locally)
+  const hasFrontend = fs.existsSync(path.join(process.cwd(), "index.html"));
+  if (process.env.NODE_ENV !== "production" && hasFrontend) {
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
