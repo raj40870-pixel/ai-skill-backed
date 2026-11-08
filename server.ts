@@ -529,11 +529,11 @@ async function generateContentReliably(options: {
     console.log(`[server] [Circuit Breaker Active] Attempting quick recovery (${remainingSec}s remaining)...`);
   }
 
-  // Lean canonical Google production models list
+  // Active verified Google production models list
   const availableFallbacks = [
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-1.5-flash"
+    "gemini-3.1-flash-lite",
+    "gemini-3.8-flash",
+    "gemini-flash-latest"
   ];
 
   const modelsToTry: string[] = [];
@@ -784,17 +784,16 @@ function cleanJSONResponse(text: string): string {
 }
 
 function mapSelectedModelToGemini(modelName?: string): string {
-  // Map models to canonical universally supported Google production versions
+  // Map models to active, verified Google production models
   const model = modelName?.toLowerCase() || "";
   
-  if (model.includes("2.5") && model.includes("pro")) return "gemini-2.5-pro";
-  if (model.includes("2.5") && model.includes("lite")) return "gemini-2.5-flash-lite";
-  if (model.includes("2.5")) return "gemini-2.5-flash";
-  if (model.includes("2.0")) return "gemini-2.0-flash";
-  if (model.includes("1.5")) return "gemini-1.5-flash";
-  if (model.includes("pro")) return "gemini-2.5-pro";
+  if (model.includes("3.8")) return "gemini-3.8-flash";
+  if (model.includes("3.1") || model.includes("lite")) return "gemini-3.1-flash-lite";
+  if (model.includes("latest")) return "gemini-flash-latest";
+  if (model.includes("pro")) return "gemini-3.8-flash";
   
-  return "gemini-2.5-flash"; // Canonical production model for Google AI Studio
+  // Return the fastest verified active model:
+  return "gemini-3.1-flash-lite";
 }
 
 
@@ -3645,9 +3644,10 @@ Cloud Platform Architecture | Tech: React, Node.js, MongoDB`;
 
       // 0. Hashing & Caching Check
       const contentHash = calculateHash(text);
+      const forceFresh = req.body.forceFresh !== false; // Fresh live AI analysis by default on all uploads
       
-      // Check if we already have a full analysis for this content and role
-      if (isMongoConnected()) {
+      // Check if we already have a full analysis for this content and role (only when forceFresh is explicitly false)
+      if (!forceFresh && isMongoConnected()) {
         try {
           const existingResume = await Resume.findOne({ userId: uid, contentHash, targetRole: role });
           if (existingResume) {
@@ -3739,6 +3739,7 @@ Cloud Platform Architecture | Tech: React, Node.js, MongoDB`;
         if (!stage12Data?.atsResult || typeof stage12Data?.atsResult?.score !== 'number') {
           throw new Error("Invalid ATS structure returned by AI model");
         }
+        console.log(`[server] [Analysis] [Stage 1-2 AI SUCCESS] Real Candidate ATS Score: ${stage12Data.atsResult.score}, Parsed Skills: ${stage12Data.parsedData?.skills?.length || 0}`);
       } catch (e12: any) {
         console.warn("[server] [Analysis] Stage 1-2 AI notice, applying realistic calibrated analysis:", e12?.message);
         stage12Data = {
@@ -3820,6 +3821,7 @@ Cloud Platform Architecture | Tech: React, Node.js, MongoDB`;
         if (!stage34Data?.marketAnalysis || !stage34Data?.gapAnalysis) {
           throw new Error("Invalid Market & Gap structure returned by AI model");
         }
+        console.log(`[server] [Analysis] [Stage 3-4 AI SUCCESS] Real Market Benchmark: ${stage34Data.marketAnalysis?.salaryRange}, Missing Skills: ${stage34Data.gapAnalysis?.missing_skills?.length || 0}`);
       } catch (e34: any) {
         console.warn("[server] [Analysis] Stage 3-4 AI notice, applying market telemetry:", e34?.message);
         stage34Data = {
@@ -3906,6 +3908,7 @@ Cloud Platform Architecture | Tech: React, Node.js, MongoDB`;
         if (!stage5Data?.sprints || !Array.isArray(stage5Data.sprints) || stage5Data.sprints.length === 0) {
           throw new Error("Invalid Roadmap structure returned by AI model");
         }
+        console.log(`[server] [Analysis] [Stage 5 AI SUCCESS] Real Roadmap Sprints: ${stage5Data.sprints?.length || 0}`);
       } catch (e5: any) {
         console.warn("[server] [Analysis] Stage 5 AI notice, applying curated flight plan:", e5?.message);
         stage5Data = {
@@ -4333,7 +4336,7 @@ Cloud Platform Architecture | Tech: React, Node.js, MongoDB`;
           console.log(`[server] [AI Vision] Scanned/image-converted PDF detected (${cleanStream.length} stream chars, ${matchedKeywordsCount} markers). Analyzing visually with Gemini OCR...`);
           try {
             const ocrResponse = await generateContentReliably({
-              model: "gemini-3.7-flash",
+              model: "gemini-3.1-flash-lite",
               contents: [
                 {
                   inlineData: {
@@ -4382,7 +4385,7 @@ Transcribe all readable information into clean, full, unshortened text organized
         console.log(`[server] [AI Vision] Analyzing photo/image scan: ${filename} (${mimeType})`);
         try {
           const ocrResponse = await generateContentReliably({
-            model: "gemini-3.7-flash",
+            model: "gemini-3.1-flash-lite",
             contents: [
               {
                 inlineData: {
