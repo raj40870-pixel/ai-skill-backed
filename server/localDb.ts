@@ -8,20 +8,27 @@ interface LocalDbData {
   resumes: any[];
   atsResults: any[];
   roadmaps: any[];
+  chatSessions?: any[];
+  supportTickets?: any[];
+  systemErrorLogs?: any[];
 }
 
 function readDb(): LocalDbData {
   try {
     if (!fs.existsSync(DB_FILE)) {
-      const defaultData = { users: [], resumes: [], atsResults: [], roadmaps: [] };
+      const defaultData = { users: [], resumes: [], atsResults: [], roadmaps: [], chatSessions: [], supportTickets: [], systemErrorLogs: [] };
       fs.writeFileSync(DB_FILE, JSON.stringify(defaultData, null, 2), 'utf8');
       return defaultData;
     }
     const content = fs.readFileSync(DB_FILE, 'utf8');
-    return JSON.parse(content || '{"users":[],"resumes":[],"atsResults":[],"roadmaps":[]}');
+    const parsed = JSON.parse(content || '{"users":[],"resumes":[],"atsResults":[],"roadmaps":[],"chatSessions":[],"supportTickets":[],"systemErrorLogs":[]}');
+    if (!parsed.chatSessions) parsed.chatSessions = [];
+    if (!parsed.supportTickets) parsed.supportTickets = [];
+    if (!parsed.systemErrorLogs) parsed.systemErrorLogs = [];
+    return parsed;
   } catch (err) {
     console.error("[localDb] Error reading file:", err);
-    return { users: [], resumes: [], atsResults: [], roadmaps: [] };
+    return { users: [], resumes: [], atsResults: [], roadmaps: [], chatSessions: [], supportTickets: [], systemErrorLogs: [] };
   }
 }
 
@@ -35,6 +42,21 @@ function writeDb(data: LocalDbData) {
 
 export const localDb = {
   // Users
+  getAllUsers() {
+    const db = readDb();
+    return db.users ? [...db.users] : [];
+  },
+
+  deleteUser(uid: string) {
+    const db = readDb();
+    db.users = (db.users || []).filter(u => u.uid !== uid);
+    db.resumes = (db.resumes || []).filter(r => r.userId !== uid);
+    db.atsResults = (db.atsResults || []).filter(a => a.userId !== uid);
+    db.roadmaps = (db.roadmaps || []).filter(rm => rm.userId !== uid);
+    db.chatSessions = (db.chatSessions || []).filter(cs => cs.userId !== uid);
+    writeDb(db);
+  },
+
   getUserByEmail(email: string) {
     const db = readDb();
     const found = db.users.find(u => u.email?.toLowerCase() === email?.toLowerCase());
@@ -79,6 +101,9 @@ export const localDb = {
       xpPoints: user.xpPoints !== undefined ? user.xpPoints : (existing.xpPoints || 1250),
       streak: user.streak !== undefined ? user.streak : (existing.streak || 7),
       plan: user.plan || existing.plan || 'FREE',
+      emailVerified: user.emailVerified !== undefined ? user.emailVerified : (existing.emailVerified ?? false),
+      otp: user.otp !== undefined ? user.otp : (existing.otp || null),
+      otpExpires: user.otpExpires !== undefined ? user.otpExpires : (existing.otpExpires || null),
       usage: user.usage || existing.usage || { analysisCount: 0, windowStartDate: new Date().toISOString() },
       preferences,
       createdAt: user.createdAt || existing.createdAt || new Date().toISOString()
@@ -100,6 +125,11 @@ export const localDb = {
     return db.resumes
       .filter(r => r.userId === userId)
       .sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
+  },
+
+  getLatestResume(userId: string) {
+    const resumes = this.getResumes(userId);
+    return resumes[0] || null;
   },
   
   saveResume(resume: any) {
@@ -132,6 +162,32 @@ export const localDb = {
     db.atsResults = db.atsResults.filter(a => a.userId !== userId);
     db.roadmaps = db.roadmaps.filter(r => r.userId !== userId);
     writeDb(db);
+  },
+
+  cleanupOldResumes(cutoffDate: Date) {
+    const db = readDb();
+    const cutoffMs = cutoffDate.getTime();
+    const expiredIds = new Set<string>();
+    
+    db.resumes = db.resumes.filter(r => {
+      const ms = new Date(r.createdAt || 0).getTime();
+      if (ms < cutoffMs) {
+        expiredIds.add(r._id || r.id);
+        return false;
+      }
+      return true;
+    });
+
+    if (expiredIds.size > 0) {
+      db.atsResults = db.atsResults.filter(a => !expiredIds.has(a.resumeId));
+      db.roadmaps = db.roadmaps.filter(rd => !expiredIds.has(rd.resumeId));
+      writeDb(db);
+    }
+  },
+
+  getAllResumes() {
+    const db = readDb();
+    return [...(db.resumes || [])].sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
   },
 
   migrateUserData(tempUid: string, uid: string) {
@@ -223,5 +279,168 @@ export const localDb = {
     db.roadmaps.push(serialized);
     writeDb(db);
     return serialized;
+  },
+
+  updateRoadmapLearningResources(userId: string, resumeId: string, resources: any, expertTip?: string) {
+    const db = readDb();
+    const target = db.roadmaps.find(r => (resumeId && r.resumeId === resumeId) || (userId && r.userId === userId));
+    if (target) {
+      target.learning_resources = resources;
+      if (expertTip) target.expertTip = expertTip;
+      writeDb(db);
+      return target;
+    }
+    return null;
+  },
+
+  // Chat Sessions
+  getChatSessions(userId: string) {
+    const db = readDb();
+    const sessions = (db.chatSessions || []).filter(cs => cs.userId === userId);
+    return sessions.sort((a, b) => new Date(b.updatedAt || b.createdAt || 0).getTime() - new Date(a.updatedAt || a.createdAt || 0).getTime());
+  },
+
+  getChatSession(userId: string, sessionId: string) {
+    const db = readDb();
+    return (db.chatSessions || []).find(cs => cs.userId === userId && cs._id === sessionId) || null;
+  },
+
+  createChatSession(userId: string, title?: string, model?: string) {
+    const db = readDb();
+    const serialized = {
+      _id: `session_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
+      userId,
+      title: title || 'New Career Discussion',
+      model: model || 'gemini-3.7-flash',
+      messages: [],
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+    if (!db.chatSessions) db.chatSessions = [];
+    db.chatSessions.push(serialized);
+    writeDb(db);
+    return serialized;
+  },
+
+  updateChatSession(userId: string, sessionId: string, updateFn: (session: any) => void) {
+    const db = readDb();
+    if (!db.chatSessions) db.chatSessions = [];
+    const session = db.chatSessions.find(cs => cs.userId === userId && cs._id === sessionId);
+    if (!session) return null;
+    updateFn(session);
+    session.updatedAt = new Date().toISOString();
+    writeDb(db);
+    return session;
+  },
+
+  deleteChatSession(userId: string, sessionId: string) {
+    const db = readDb();
+    if (!db.chatSessions) db.chatSessions = [];
+    db.chatSessions = db.chatSessions.filter(cs => !(cs.userId === userId && cs._id === sessionId));
+    writeDb(db);
+    return true;
+  },
+
+  // Support Tickets
+  saveTicket(ticket: any) {
+    const db = readDb();
+    if (!db.supportTickets) db.supportTickets = [];
+    const existingIndex = db.supportTickets.findIndex(t => t.ticketId === ticket.ticketId);
+    if (existingIndex >= 0) {
+      db.supportTickets[existingIndex] = { ...db.supportTickets[existingIndex], ...ticket, updatedAt: new Date().toISOString() };
+    } else {
+      db.supportTickets.unshift({
+        ...ticket,
+        createdAt: ticket.createdAt || new Date().toISOString(),
+        updatedAt: ticket.updatedAt || new Date().toISOString()
+      });
+    }
+    writeDb(db);
+    return ticket;
+  },
+
+  getAllTickets() {
+    const db = readDb();
+    return db.supportTickets ? [...db.supportTickets] : [];
+  },
+
+  getTicketsByEmailOrUser(emailOrUid: string) {
+    const db = readDb();
+    const query = (emailOrUid || '').toLowerCase().trim();
+    if (!query) return [];
+    return (db.supportTickets || []).filter(t => 
+      (t.userEmail && t.userEmail.toLowerCase() === query) ||
+      (t.userId && t.userId === query)
+    );
+  },
+
+  getTicketById(ticketId: string) {
+    const db = readDb();
+    return (db.supportTickets || []).find(t => t.ticketId?.toLowerCase() === ticketId?.toLowerCase()) || null;
+  },
+
+  updateTicket(ticketId: string, updateData: any) {
+    const db = readDb();
+    if (!db.supportTickets) db.supportTickets = [];
+    const index = db.supportTickets.findIndex(t => t.ticketId?.toLowerCase() === ticketId?.toLowerCase());
+    if (index >= 0) {
+      db.supportTickets[index] = {
+        ...db.supportTickets[index],
+        ...updateData,
+        updatedAt: new Date().toISOString()
+      };
+      writeDb(db);
+      return db.supportTickets[index];
+    }
+    return null;
+  },
+
+  // System Error Telemetry Logs
+  saveSystemErrorLog(log: any) {
+    const db = readDb();
+    if (!db.systemErrorLogs) db.systemErrorLogs = [];
+    const entry = {
+      ...log,
+      resolved: log.resolved ?? false,
+      createdAt: log.createdAt || new Date().toISOString()
+    };
+    db.systemErrorLogs.unshift(entry);
+    // Keep max 500 in local fallback file
+    if (db.systemErrorLogs.length > 500) {
+      db.systemErrorLogs = db.systemErrorLogs.slice(0, 500);
+    }
+    writeDb(db);
+    return entry;
+  },
+
+  getSystemErrorLogs(limit = 100) {
+    const db = readDb();
+    const logs = db.systemErrorLogs || [];
+    return logs.slice(0, limit);
+  },
+
+  resolveSystemErrorLog(errorId: string) {
+    const db = readDb();
+    if (!db.systemErrorLogs) return null;
+    const item = db.systemErrorLogs.find(l => l.errorId === errorId);
+    if (item) {
+      item.resolved = !item.resolved;
+      writeDb(db);
+      return item;
+    }
+    return null;
+  },
+
+  clearSystemErrorLogs(onlyResolved = true) {
+    const db = readDb();
+    if (!db.systemErrorLogs) return 0;
+    const initialCount = db.systemErrorLogs.length;
+    if (onlyResolved) {
+      db.systemErrorLogs = db.systemErrorLogs.filter(l => !l.resolved);
+    } else {
+      db.systemErrorLogs = [];
+    }
+    writeDb(db);
+    return initialCount - db.systemErrorLogs.length;
   }
 };
