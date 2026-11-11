@@ -4392,6 +4392,9 @@ Transcribe all readable information into clean, complete text formatted by secti
           console.error(`[server] [AI Vision] Photo analysis error:`, aiError.message || aiError);
           text = "";
         }
+      } else if (ext === 'txt' || mimeType.includes('text/plain') || mimeType.includes('text/')) {
+        text = buffer.toString('utf8');
+        extractionMethod = "plain-text";
       } else {
         return res.status(400).json({ error: "Unsupported file type. Please upload a PDF, Photo (JPG, PNG), or Word Document." });
       }
@@ -4403,9 +4406,98 @@ Transcribe all readable information into clean, complete text formatted by secti
         });
       }
 
-      const professionInfo = detectProfession(text);
-      console.log(`[server] [Document Parser] Success! Returning resume text (${text.length} chars, detected: ${professionInfo.role}).`);
-      res.json({ text, extractionMethod, detectedRole: professionInfo.role, detectedIndustry: professionInfo.industry });
+      // Extract real candidate role, skills, and background using Gemini AI from API keys pool
+      let detectedRole = "Software Engineer";
+      let detectedIndustry = "Technology";
+      let candidateName = "";
+      let parsedSkills: string[] = [];
+      let parsedExperience: any[] = [];
+      let parsedEducation: any[] = [];
+      let parsedSummary = "";
+
+      try {
+        console.log(`[server] [AI Document Analysis] Calling Gemini AI to accurately index candidate background...`);
+        const aiAnalysis = await generateContentReliably({
+          model: "gemini-3.1-flash-lite",
+          contents: `You are an expert executive talent assessor and resume indexing AI.
+Analyze this resume text and extract the candidate's ACTUAL target profession / primary job title, key skills, and experience background.
+CRITICAL: Do NOT default to generic titles like "Software Engineer" if the candidate has a specific domain. Look closely at their projects, skills, and experience:
+If they work with LLMs, autonomous agents, LangChain, OpenAI, or AI workflows, identify as "Agentic AI Developer" or "AI Systems Engineer".
+If they build web frontends with React/Vue/Next, identify as "Frontend Developer" or "Full Stack Developer".
+If they specialize in backend/APIs/microservices, identify as "Backend Developer".
+If they work on data models/pandas/ML, identify as "Data Scientist" or "Machine Learning Engineer".
+If they work on devops/cloud/k8s/docker, identify as "DevOps Engineer".
+Identify the EXACT role that reflects their real background.
+
+Resume text:
+${text.slice(0, 8000)}
+
+Return ONLY a valid JSON object matching this schema:
+{
+  "candidateName": string,
+  "detectedRole": string,
+  "detectedIndustry": string,
+  "skills": string[],
+  "yearsOfExperience": number,
+  "summary": string,
+  "experience": [
+    {
+      "role": string,
+      "company": string,
+      "years": number,
+      "bullets": string[]
+    }
+  ],
+  "education": [
+    {
+      "degree": string,
+      "institute": string,
+      "year": number
+    }
+  ]
+}`,
+          config: {
+            responseMimeType: "application/json"
+          }
+        });
+
+        const parsedJson = JSON.parse(cleanJSONResponse(aiAnalysis.text || "{}"));
+        if (parsedJson.detectedRole) detectedRole = parsedJson.detectedRole;
+        if (parsedJson.detectedIndustry) detectedIndustry = parsedJson.detectedIndustry;
+        if (parsedJson.candidateName) candidateName = parsedJson.candidateName;
+        if (Array.isArray(parsedJson.skills) && parsedJson.skills.length > 0) parsedSkills = parsedJson.skills;
+        if (Array.isArray(parsedJson.experience) && parsedJson.experience.length > 0) parsedExperience = parsedJson.experience;
+        if (Array.isArray(parsedJson.education) && parsedJson.education.length > 0) parsedEducation = parsedJson.education;
+        if (parsedJson.summary) parsedSummary = parsedJson.summary;
+
+        console.log(`[server] [AI Document Analysis] Verified Role: "${detectedRole}", Candidate: "${candidateName}", Skills Count: ${parsedSkills.length}`);
+      } catch (aiErr: any) {
+        console.warn(`[server] [AI Document Analysis] AI parsing note:`, aiErr.message);
+        const fallback = detectProfession(text);
+        detectedRole = fallback.role;
+        detectedIndustry = fallback.industry;
+        parsedSkills = fallback.skills;
+        parsedExperience = [{ role: fallback.role, company: fallback.company, years: 2, bullets: fallback.bullets }];
+      }
+
+      console.log(`[server] [Document Parser] Returning verified resume (${text.length} chars, role: ${detectedRole}).`);
+      res.json({
+        text,
+        extractionMethod,
+        detectedRole,
+        detectedIndustry,
+        candidateName,
+        skills: parsedSkills,
+        experience: parsedExperience,
+        education: parsedEducation,
+        summary: parsedSummary,
+        data: {
+          skills: parsedSkills,
+          experience: parsedExperience,
+          education: parsedEducation,
+          keywords: parsedSkills
+        }
+      });
     } catch (globalErr: any) {
       console.error("[server] [Document Parser] Error processing document:", globalErr.message || globalErr);
       res.status(500).json({ error: globalErr.message || "Failed to process uploaded document." });
