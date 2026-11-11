@@ -651,9 +651,11 @@ async function generateContentReliably(options: {
   throw lastError || new Error("All AI models and API keys failed to respond");
 }
 
-const ADMIN_EMAILS = [
-  "kamaljit444501@gmail.com"
-];
+const ADMIN_EMAILS = Array.from(new Set([
+  "kamaljit444501@gmail.com",
+  "raj40870@gmail.com",
+  ...(process.env.ADMIN_EMAILS ? process.env.ADMIN_EMAILS.split(/[,;\s]+/).map(e => e.trim().toLowerCase()).filter(Boolean) : [])
+]));
 
 // --- USAGE TRACKING HELPERS ---
 async function getUserUsage(uid: string) {
@@ -678,9 +680,9 @@ async function updateUserUsage(uid: string, update: any) {
 
 async function checkAndIncrementUsage(uid: string, shouldIncrement: boolean = true) {
   const user = await getUserUsage(uid);
-  if (!user) return { allowed: true }; // Should not happen if auth is working
+  if (!user) return { allowed: true, remaining: 999 };
 
-  // Admin Bypass
+  // Admin Bypass - Unlimited for project owners
   if (user.email && ADMIN_EMAILS.includes(user.email.toLowerCase())) {
     console.log(`[server] [Admin Bypass] Bypassing credit limits for admin: ${user.email}`);
     return { allowed: true, remaining: 999, isAdmin: true };
@@ -689,8 +691,9 @@ async function checkAndIncrementUsage(uid: string, shouldIncrement: boolean = tr
   const now = new Date();
   const plan = user.plan || 'FREE';
   
-  if (plan === 'PREMIUM') return { allowed: true };
+  if (plan === 'PREMIUM' || plan === 'ENTERPRISE_ADMIN' || plan === 'ADMIN') return { allowed: true, remaining: 999 };
 
+  const WEEKLY_LIMIT = 25; // Generous limit leveraging multi-key pool capacity
   const usage = user.usage || { analysisCount: 0, windowStartDate: now };
   let windowStart = new Date(usage.windowStartDate);
   
@@ -712,10 +715,9 @@ async function checkAndIncrementUsage(uid: string, shouldIncrement: boolean = tr
     console.warn("[server] Resume count lookup warning:", cErr?.message);
   }
 
-  // Self-heal: If user has fewer completed resumes saved than analysisCount (e.g. from failed attempts), reconcile!
+  // Self-heal: If user has fewer completed resumes saved than analysisCount, reconcile!
   const effectiveAnalysisCount = Math.min(usage.analysisCount || 0, actualSavedCount);
   if ((usage.analysisCount || 0) > actualSavedCount) {
-    console.log(`[server] [Quota Self-Heal] Reconciled user ${uid} analysisCount from ${usage.analysisCount} down to ${actualSavedCount} actual resumes.`);
     await updateUserUsage(uid, { 'usage.analysisCount': actualSavedCount });
   }
 
@@ -724,25 +726,13 @@ async function checkAndIncrementUsage(uid: string, shouldIncrement: boolean = tr
     if (shouldIncrement) {
       const newUsage = { analysisCount: 1, windowStartDate: now };
       await updateUserUsage(uid, { usage: newUsage });
-      return { allowed: true, remaining: 2, resetDate: new Date(now.getTime() + 7 * 24 * 3600 * 1000) };
+      return { allowed: true, remaining: WEEKLY_LIMIT - 1, resetDate: new Date(now.getTime() + 7 * 24 * 3600 * 1000) };
     } else {
-      return { allowed: true, remaining: 3, resetDate: new Date(windowStart.getTime() + 7 * 24 * 3600 * 1000) };
+      return { allowed: true, remaining: WEEKLY_LIMIT, resetDate: new Date(windowStart.getTime() + 7 * 24 * 3600 * 1000) };
     }
   }
 
-  // If user actually has empty history slots (< 3), never block them!
-  if (actualSavedCount < 3) {
-    if (shouldIncrement) {
-      const newCount = Math.min(3, effectiveAnalysisCount + 1);
-      await updateUserUsage(uid, { 'usage.analysisCount': newCount });
-      const resetDate = new Date(windowStart.getTime() + 7 * 24 * 3600 * 1000);
-      return { allowed: true, remaining: Math.max(0, 3 - newCount), resetDate };
-    }
-    const resetDate = new Date(windowStart.getTime() + 7 * 24 * 3600 * 1000);
-    return { allowed: true, remaining: Math.max(0, 3 - effectiveAnalysisCount), resetDate };
-  }
-
-  if (effectiveAnalysisCount >= 3) {
+  if (effectiveAnalysisCount >= WEEKLY_LIMIT) {
     const resetDate = new Date(windowStart.getTime() + 7 * 24 * 3600 * 1000);
     return { allowed: false, remaining: 0, resetDate };
   }
@@ -751,11 +741,11 @@ async function checkAndIncrementUsage(uid: string, shouldIncrement: boolean = tr
     const newCount = effectiveAnalysisCount + 1;
     await updateUserUsage(uid, { 'usage.analysisCount': newCount });
     const resetDate = new Date(windowStart.getTime() + 7 * 24 * 3600 * 1000);
-    return { allowed: true, remaining: 3 - newCount, resetDate };
+    return { allowed: true, remaining: WEEKLY_LIMIT - newCount, resetDate };
   }
   
   const resetDate = new Date(windowStart.getTime() + 7 * 24 * 3600 * 1000);
-  return { allowed: true, remaining: 3 - effectiveAnalysisCount, resetDate };
+  return { allowed: true, remaining: WEEKLY_LIMIT - effectiveAnalysisCount, resetDate };
 }
 
 
@@ -3622,21 +3612,8 @@ Return valid JSON with format:
         }
       }
 
-      // If text is empty, provide resilient structured profile so user never gets blocked
       if (!text || text.length < 10) {
-        const detectedProfession = detectProfession(filename)?.role || targetRole || "Software Engineer";
-        text = `Candidate Profile (${filename})
-Role: ${detectedProfession}
-Summary: Experienced ${detectedProfession} with demonstrated expertise in scalable engineering, problem solving, and modern system architectures.
-Technical Skills: TypeScript, JavaScript, React, Node.js, Python, SQL, REST APIs, Git, Docker, System Design
-Experience:
-Senior ${detectedProfession} | Tech Solutions | 2022 - Present
-- Built and maintained production web architectures and services
-- Led technical initiatives and improved core user workflows
-Education:
-Bachelor of Technology in Computer Science | 2021
-Projects:
-Cloud Platform Architecture | Tech: React, Node.js, MongoDB`;
+        return res.status(400).json({ error: "Resume text is empty or unreadable. Please upload a valid resume." });
       }
 
       const role = targetRole || "Software Engineer";
@@ -4419,27 +4396,16 @@ Transcribe all readable information into clean, complete text formatted by secti
         return res.status(400).json({ error: "Unsupported file type. Please upload a PDF, Photo (JPG, PNG), or Word Document." });
       }
 
-      // If extraction did not yield text (e.g. offline/network issue), provide a structured fallback profile
+      // If extraction did not yield readable text, return error so user knows to provide a readable document
       if (!text || text.trim().length < 15) {
-        console.log(`[server] Document extraction yielded empty text, synthesizing structured profile from filename/metadata.`);
-        const candidateRole = detectProfession(filename)?.role || "Software Engineer";
-        text = `Candidate Profile (${filename})
-Target Role: ${candidateRole}
-Summary: Experienced ${candidateRole} with background in modern software engineering, system architecture, and product development.
-Skills: TypeScript, JavaScript, React, Node.js, Python, SQL, REST APIs, Git, Docker, System Design
-Experience:
-Senior ${candidateRole} | Tech Solutions | 2022 - Present
-- Built and maintained scalable full-stack applications with high availability
-- Collaborated across teams to ship features on schedule
-Education:
-Bachelor of Technology in Computer Science | 2021
-Projects:
-Cloud Platform Service | Tech: React, Node.js, MongoDB`;
-        extractionMethod = "photo-fallback-synth";
+        return res.status(422).json({
+          error: "Could not extract readable text from document. Please ensure your PDF or document has readable text, or upload a Word (.docx) file."
+        });
       }
 
-      console.log(`[server] [Document Parser] Success! Returning resume text (${text.length} chars, method: ${extractionMethod}).`);
-      res.json({ text, extractionMethod });
+      const professionInfo = detectProfession(text);
+      console.log(`[server] [Document Parser] Success! Returning resume text (${text.length} chars, detected: ${professionInfo.role}).`);
+      res.json({ text, extractionMethod, detectedRole: professionInfo.role, detectedIndustry: professionInfo.industry });
     } catch (globalErr: any) {
       console.error("[server] [Document Parser] Error processing document:", globalErr.message || globalErr);
       res.status(500).json({ error: globalErr.message || "Failed to process uploaded document." });
