@@ -521,7 +521,7 @@ async function generateContentReliably(options: {
   config?: any;
   timeoutMs?: number;
 }): Promise<any> {
-  const timeoutMs = options.timeoutMs || 12000; // 12 seconds per attempt
+  const timeoutMs = options.timeoutMs || 20000; // Increased default timeout to 20000ms
   const now = Date.now();
   
   if (now < quotaCircuitBreakerUntil) {
@@ -529,7 +529,7 @@ async function generateContentReliably(options: {
     console.log(`[server] [Circuit Breaker Active] Attempting quick recovery (${remainingSec}s remaining)...`);
   }
 
-  // Active verified Google production models list
+  // Active verified Google production models list - prioritize fast, healthy production models
   const availableFallbacks = [
     "gemini-3.1-flash-lite",
     "gemini-3.8-flash",
@@ -600,6 +600,12 @@ async function generateContentReliably(options: {
                                     errorDetails.includes("API_KEY_INVALID") ||
                                     errorDetails.includes("API key not valid");
 
+          const isTimeoutOrNetwork = rawMessage.includes("Timeout") ||
+                                     errorDetails.includes("ETIMEDOUT") ||
+                                     errorDetails.includes("ECONNRESET") ||
+                                     errorDetails.includes("fetch failed") ||
+                                     errorDetails.includes("network");
+
           const isUnavailable = errorDetails.includes("503") || 
                                errorDetails.includes("UNAVAILABLE") || 
                                errorDetails.includes("high demand") || 
@@ -607,19 +613,20 @@ async function generateContentReliably(options: {
 
           console.warn(`[server] [AI Attempt Note] Model ${currentModel} (key: ${keyPreview}): ${rawMessage || errorDetails.substring(0, 150)}`);
 
-          // 2. Immediate Instant Key Failover (No Model Looping on Bad Keys):
-          if (isQuotaError || isPermissionError) {
+          // 2. Immediate Instant Key Failover (No Model Looping on Bad or Stalled Keys):
+          if (isQuotaError || isPermissionError || isTimeoutOrNetwork) {
             keyHitHardError = true;
-            // Put that key on cooldown for 120 seconds in keyCooldowns
+            const cooldownDuration = (isQuotaError || isPermissionError) ? 120000 : 45000;
+            // Put that key on cooldown in keyCooldowns
             if (key) {
-              keyCooldowns.set(key, Date.now() + 120000);
+              keyCooldowns.set(key, Date.now() + cooldownDuration);
               exhaustedKeys.add(key);
-              console.warn(`[server] [AI Multi-Key Failover] Key ${keyPreview} hit ${isQuotaError ? 'quota (429)' : 'permission (403)'}. Cooldown 120s set. Immediately rotating to next key in pool.`);
+              console.warn(`[server] [AI Multi-Key Failover] Key ${keyPreview} hit ${isQuotaError ? 'quota (429)' : isPermissionError ? 'permission (403)' : 'timeout/network error'}. Cooldown ${Math.round(cooldownDuration / 1000)}s set. Immediately rotating to next key in pool.`);
               logServerSystemError({
-                type: isQuotaError ? 'GEMINI_QUOTA' : 'API_FAILURE',
-                severity: isQuotaError ? 'WARNING' : 'CRITICAL',
+                type: isQuotaError ? 'GEMINI_QUOTA' : isPermissionError ? 'API_FAILURE' : 'API_FAILURE',
+                severity: isPermissionError ? 'CRITICAL' : 'WARNING',
                 component: 'Gemini Multi-Key Pool',
-                message: `Gemini Key ${keyPreview} returned ${isQuotaError ? '429 Quota Exceeded' : '403 Permission Denied'}: ${rawMessage.slice(0, 150)}`
+                message: `Gemini Key ${keyPreview} error: ${rawMessage.slice(0, 150)}`
               });
             }
             break; // Break completely out of the inner model loop!
@@ -636,7 +643,7 @@ async function generateContentReliably(options: {
       }
 
       if (keyHitHardError) {
-        break; // Stop trying models with this quota-exhausted key, rotate to next key in pool immediately
+        break; // Stop trying models with this stalled/bad key, rotate to next key in pool immediately
       }
     }
 
@@ -4277,7 +4284,7 @@ Return valid JSON with format:
 
       console.log(`[server] [Document Parser] Processing ${filename} (mime: ${mimeType}, size: ${buffer.length} bytes)`);
 
-      // 1. PDF Handling (Both Word-generated digital PDFs & Image-converted / Scanned PDFs)
+      // 1. PDF Handling (Both Word-generated digital PDFs & Image-converted / Scanned / Multi-column PDFs)
       if (mimeType === 'application/pdf') {
         let streamText = "";
         try {
@@ -4297,23 +4304,34 @@ Return valid JSON with format:
         const cleanStream = (streamText || "").trim();
         const lowerStream = cleanStream.toLowerCase();
         
-        // Check for genuine digital resume content vs empty metadata / scanned image PDF
+        // Strict tokens analysis for fragmented or font-corrupted text (Canva, multi-column, spaced fonts)
+        const tokens = cleanStream.split(/\s+/).filter(Boolean);
+        const totalTokens = tokens.length;
+        const singleCharTokens = tokens.filter(t => t.length === 1 && /[a-zA-Z]/.test(t)).length;
+        const multiCharWords = tokens.filter(t => t.length >= 2 && /[a-zA-Z]/.test(t));
+        const singleCharRatio = totalTokens > 0 ? (singleCharTokens / totalTokens) : 1;
+
+        // Check for genuine resume structural markers
         const resumeKeywords = ['experience', 'skills', 'education', 'project', 'work', 'summary', 'developer', 'engineer', 'technolog', 'university', 'college', 'phone', 'email', '@', 'management', 'responsibilit', 'software', 'profile', 'curriculum', 'vitae', 'coursework'];
         const matchedKeywordsCount = resumeKeywords.filter(k => lowerStream.includes(k)).length;
         
-        // A true digital text resume will have substantial text AND match multiple resume structural keywords
-        const isTrueDigitalResume = cleanStream.length >= 180 && matchedKeywordsCount >= 2;
+        // Quality Gate: Only trust direct stream if length >= 400, multiCharWords >= 55, matchedKeywords >= 3, and singleCharRatio <= 0.32
+        const isDigitalStreamValid = cleanStream.length >= 400 && 
+                                     multiCharWords.length >= 55 && 
+                                     matchedKeywordsCount >= 3 && 
+                                     singleCharRatio <= 0.32;
 
-        if (isTrueDigitalResume) {
+        if (isDigitalStreamValid) {
           text = cleanStream;
           extractionMethod = "pdf-digital";
-          console.log(`[server] [PDF Parser] Digital PDF text extracted (${text.length} characters, ${matchedKeywordsCount} resume markers).`);
+          console.log(`[server] [PDF Parser] Digital PDF text validated (${text.length} characters, ${matchedKeywordsCount} markers, ${multiCharWords.length} words, charRatio: ${singleCharRatio.toFixed(2)}).`);
         } else {
-          // Scanned image-based PDF detected (photo or scanned resume converted to PDF) — Gemini Multimodal AI OCR
-          console.log(`[server] [AI Vision] Scanned/image-converted PDF detected (${cleanStream.length} stream chars, ${matchedKeywordsCount} markers). Analyzing visually with Gemini OCR...`);
+          // Scanned image, complex multi-column, or font-corrupted PDF detected — Run Gemini Multimodal Vision OCR with 25s timeout
+          console.log(`[server] [AI Vision] PDF failed digital quality gate (length: ${cleanStream.length}, words: ${multiCharWords.length}, markers: ${matchedKeywordsCount}, singleCharRatio: ${singleCharRatio.toFixed(2)}). Running Gemini Multimodal Vision OCR...`);
           try {
             const ocrResponse = await generateContentReliably({
               model: "gemini-3.1-flash-lite",
+              timeoutMs: 25000,
               contents: [
                 {
                   inlineData: {
@@ -4323,10 +4341,10 @@ Return valid JSON with format:
                 },
                 {
                   text: `You are an expert document reading and optical character recognition (OCR) AI.
-This document is a scanned or image-converted PDF resume (a photo or scan of a CV saved as a PDF).
-Perform OCR reading across the entire document and extract ALL text, candidate background, and career sections with high accuracy:
+This document is a resume or CV PDF (multi-column, stylized, or scanned).
+Perform thorough OCR reading across the entire document including main text, columns, sidebars, headers, and footers. Extract ALL text, candidate background, and career sections with high accuracy:
 1. Candidate Name, Email, Phone, Location, Portfolio / GitHub / LinkedIn links
-2. Profile Summary / Career Objective
+2. Profile Summary / Career Objective / Professional Headline
 3. Professional Work Experience (Job Titles, Companies, Dates, Bullet Points, Technologies used)
 4. Skills (Technical Skills, Programming Languages, Frameworks, Tools, Methodologies, Soft Skills)
 5. Education (Degrees, Colleges / Universities, Graduation Years, CGPA / Grades)
@@ -4337,15 +4355,21 @@ Transcribe all readable information into clean, full, unshortened text organized
                 }
               ]
             });
-            text = (ocrResponse.text || "").trim();
-            if (!text && cleanStream.length >= 30) {
+            const ocrText = (ocrResponse.text || "").trim();
+            if (ocrText.length >= 50) {
+              text = ocrText;
+              extractionMethod = "pdf-multimodal-vision";
+              console.log(`[server] [AI Vision] Multimodal PDF Vision OCR successful (${text.length} chars).`);
+            } else if (cleanStream.length >= 50) {
               text = cleanStream;
+              extractionMethod = "pdf-stream-fallback";
             }
-            extractionMethod = "pdf-scanned-vision";
-            console.log(`[server] [AI Vision] Scanned PDF visual OCR transcription successful (${text.length} chars).`);
           } catch (ocrError: any) {
-            console.error(`[server] [AI Vision] Scanned PDF processing failed:`, ocrError.message || ocrError);
-            text = cleanStream;
+            console.error(`[server] [AI Vision] Multimodal PDF OCR failed:`, ocrError.message || ocrError);
+            if (cleanStream.length >= 50) {
+              text = cleanStream;
+              extractionMethod = "pdf-stream-fallback";
+            }
           }
         }
       } 
@@ -4363,6 +4387,7 @@ Transcribe all readable information into clean, full, unshortened text organized
         try {
           const ocrResponse = await generateContentReliably({
             model: "gemini-3.1-flash-lite",
+            timeoutMs: 25000,
             contents: [
               {
                 inlineData: {
@@ -4406,37 +4431,61 @@ Transcribe all readable information into clean, complete text formatted by secti
         });
       }
 
-      // Extract real candidate role, skills, and background using Gemini AI from API keys pool
-      let detectedRole = "Software Engineer";
+      // Extract real candidate role, skills, and evidence-first background using Gemini AI (temperature: 0.15, up to 16000 chars)
+      let detectedRole = "";
+      let currentRole = "";
       let detectedIndustry = "Technology";
       let candidateName = "";
+      let roleReasoning = "";
+      let suggestedTargetRoles: Array<{ role: string; matchPercent: number; reason: string }> = [];
       let parsedSkills: string[] = [];
       let parsedExperience: any[] = [];
       let parsedEducation: any[] = [];
       let parsedSummary = "";
 
       try {
-        console.log(`[server] [AI Document Analysis] Calling Gemini AI to accurately index candidate background...`);
+        console.log(`[server] [AI Document Analysis] Calling Gemini AI for evidence-first role detection (${text.length} chars)...`);
         const aiAnalysis = await generateContentReliably({
           model: "gemini-3.1-flash-lite",
-          contents: `You are an expert executive talent assessor and resume indexing AI.
-Analyze this resume text and extract the candidate's ACTUAL target profession / primary job title, key skills, and experience background.
-CRITICAL: Do NOT default to generic titles like "Software Engineer" if the candidate has a specific domain. Look closely at their projects, skills, and experience:
-If they work with LLMs, autonomous agents, LangChain, OpenAI, or AI workflows, identify as "Agentic AI Developer" or "AI Systems Engineer".
-If they build web frontends with React/Vue/Next, identify as "Frontend Developer" or "Full Stack Developer".
-If they specialize in backend/APIs/microservices, identify as "Backend Developer".
-If they work on data models/pandas/ML, identify as "Data Scientist" or "Machine Learning Engineer".
-If they work on devops/cloud/k8s/docker, identify as "DevOps Engineer".
-Identify the EXACT role that reflects their real background.
+          timeoutMs: 20000,
+          contents: `You are an expert executive talent assessor, recruiter, and resume indexing AI.
+Analyze this resume text and extract the candidate's ACTUAL target profession / primary job title, key skills, experience, and background evidence.
 
-Resume text:
-${text.slice(0, 8000)}
+CRITICAL INSTRUCTIONS FOR TARGET ROLE ASSIGNMENT:
+1. Examine:
+   a. Explicit Resume Headline, Title, Profile Summary, and Career Objective.
+   b. Most recent and longest professional work experience or internships.
+   c. Dominant tech stacks, tools, frameworks, and hands-on projects (>60% focus).
+2. Work across ALL domains (technical and non-technical):
+   - Agentic AI / Generative AI / LLM Engineering: if they build AI agents, LangChain, LangGraph, tool calling, prompt systems, assign "Agentic AI Developer" or "AI Systems Engineer".
+   - Web / Frontend: if React, Vue, Next.js, CSS, assign "Frontend Developer" or "Full Stack Developer".
+   - Backend / APIs: if Node.js, Express, Go, Python APIs, Spring, Microservices, assign "Backend Developer".
+   - Data & ML: if Pandas, SQL, ML models, PyTorch, Scikit, assign "Data Scientist", "Data Analyst", or "Machine Learning Engineer".
+   - Cloud / DevOps: if Docker, Kubernetes, AWS, CI/CD, Terraform, assign "DevOps Engineer" or "Cloud Platform Engineer".
+   - Mobile: if React Native, Flutter, Swift, Kotlin, assign "Mobile Application Developer".
+   - Cybersecurity: if penetration testing, SIEM, SOC, vulnerability management, assign "Cybersecurity Analyst".
+   - Non-technical / Business / Design: Product Manager, UI/UX Designer, Marketing Strategist, Financial Analyst, HR Operations, etc.
+3. NEVER assign generic titles like "Software Engineer", "Student", or "Intern" if their projects, skills, or experience demonstrate a specific specialization. Assign the exact, evidence-based professional title.
+4. Formulate "roleReasoning": Exactly 1-2 concise sentences directly citing specific evidence from their resume (e.g. key projects, tools, titles) that proves why this role was assigned.
+5. Provide "suggestedTargetRoles": Top 3-4 ranked target roles for this candidate with match percentage (80-98%) and a 1-sentence reason.
+
+Resume Text:
+${text.slice(0, 16000)}
 
 Return ONLY a valid JSON object matching this schema:
 {
   "candidateName": string,
   "detectedRole": string,
+  "currentRole": string,
   "detectedIndustry": string,
+  "roleReasoning": string,
+  "suggestedTargetRoles": [
+    {
+      "role": string,
+      "matchPercent": number,
+      "reason": string
+    }
+  ],
   "skills": string[],
   "yearsOfExperience": number,
   "summary": string,
@@ -4457,27 +4506,39 @@ Return ONLY a valid JSON object matching this schema:
   ]
 }`,
           config: {
-            responseMimeType: "application/json"
+            responseMimeType: "application/json",
+            temperature: 0.15
           }
         });
 
         const parsedJson = JSON.parse(cleanJSONResponse(aiAnalysis.text || "{}"));
-        if (parsedJson.detectedRole) detectedRole = parsedJson.detectedRole;
-        if (parsedJson.detectedIndustry) detectedIndustry = parsedJson.detectedIndustry;
-        if (parsedJson.candidateName) candidateName = parsedJson.candidateName;
+        if (parsedJson.detectedRole) detectedRole = String(parsedJson.detectedRole).trim();
+        if (parsedJson.currentRole) currentRole = String(parsedJson.currentRole).trim();
+        if (parsedJson.detectedIndustry) detectedIndustry = String(parsedJson.detectedIndustry).trim();
+        if (parsedJson.candidateName) candidateName = String(parsedJson.candidateName).trim();
+        if (parsedJson.roleReasoning) roleReasoning = String(parsedJson.roleReasoning).trim();
+        if (Array.isArray(parsedJson.suggestedTargetRoles) && parsedJson.suggestedTargetRoles.length > 0) {
+          suggestedTargetRoles = parsedJson.suggestedTargetRoles.map((s: any) => ({
+            role: String(s.role || '').trim(),
+            matchPercent: Number(s.matchPercent) || 85,
+            reason: String(s.reason || '').trim()
+          })).filter((s: any) => s.role);
+        }
         if (Array.isArray(parsedJson.skills) && parsedJson.skills.length > 0) parsedSkills = parsedJson.skills;
         if (Array.isArray(parsedJson.experience) && parsedJson.experience.length > 0) parsedExperience = parsedJson.experience;
         if (Array.isArray(parsedJson.education) && parsedJson.education.length > 0) parsedEducation = parsedJson.education;
         if (parsedJson.summary) parsedSummary = parsedJson.summary;
 
+        if (!detectedRole && parsedExperience.length > 0 && parsedExperience[0]?.role) {
+          detectedRole = parsedExperience[0].role;
+        }
+
         console.log(`[server] [AI Document Analysis] Verified Role: "${detectedRole}", Candidate: "${candidateName}", Skills Count: ${parsedSkills.length}`);
       } catch (aiErr: any) {
-        console.warn(`[server] [AI Document Analysis] AI parsing note:`, aiErr.message);
-        const fallback = detectProfession(text);
-        detectedRole = fallback.role;
-        detectedIndustry = fallback.industry;
-        parsedSkills = fallback.skills;
-        parsedExperience = [{ role: fallback.role, company: fallback.company, years: 2, bullets: fallback.bullets }];
+        console.error(`[server] [AI Document Analysis] Gemini AI parsing error:`, aiErr.message || aiErr);
+        return res.status(503).json({
+          error: "AI Resume Intelligence is temporarily overloaded. Please try again in a few moments."
+        });
       }
 
       console.log(`[server] [Document Parser] Returning verified resume (${text.length} chars, role: ${detectedRole}).`);
@@ -4485,8 +4546,11 @@ Return ONLY a valid JSON object matching this schema:
         text,
         extractionMethod,
         detectedRole,
+        currentRole,
         detectedIndustry,
         candidateName,
+        roleReasoning,
+        suggestedTargetRoles,
         skills: parsedSkills,
         experience: parsedExperience,
         education: parsedEducation,
