@@ -666,11 +666,10 @@ async function generateContentReliably(options: {
   throw lastError || new Error("All AI models and API keys failed to respond");
 }
 
-const ADMIN_EMAILS = Array.from(new Set([
-  "kamaljit444501@gmail.com",
-  "raj40870@gmail.com",
-  ...(process.env.ADMIN_EMAILS ? process.env.ADMIN_EMAILS.split(/[,;\s]+/).map(e => e.trim().toLowerCase()).filter(Boolean) : [])
-]));
+const FOUNDER_EMAIL = "kamaljit444501@gmail.com";
+const ADMIN_EMAILS = [FOUNDER_EMAIL];
+const isFounderEmail = (email?: string | null): boolean =>
+  typeof email === "string" && email.toLowerCase().trim() === FOUNDER_EMAIL;
 
 // --- USAGE TRACKING HELPERS ---
 async function getUserUsage(uid: string) {
@@ -697,16 +696,16 @@ async function checkAndIncrementUsage(uid: string, shouldIncrement: boolean = tr
   const user = await getUserUsage(uid);
   if (!user) return { allowed: true, remaining: 999 };
 
-  // Admin Bypass - Unlimited for project owners
-  if (user.email && ADMIN_EMAILS.includes(user.email.toLowerCase())) {
-    console.log(`[server] [Admin Bypass] Bypassing credit limits for admin: ${user.email}`);
+  // Founder Bypass - Unlimited strictly for the official Founder account
+  if (isFounderEmail(user.email)) {
+    console.log(`[server] [Founder Bypass] Bypassing credit limits for official Founder: ${user.email}`);
     return { allowed: true, remaining: 999, isAdmin: true };
   }
 
   const now = new Date();
-  const plan = user.plan || 'FREE';
+  const plan = user.plan === 'PREMIUM' ? 'PREMIUM' : 'FREE';
   
-  if (plan === 'PREMIUM' || plan === 'ENTERPRISE_ADMIN' || plan === 'ADMIN') return { allowed: true, remaining: 999 };
+  if (plan === 'PREMIUM') return { allowed: true, remaining: 999 };
 
   const WEEKLY_LIMIT = 25; // Generous limit leveraging multi-key pool capacity
   const usage = user.usage || { analysisCount: 0, windowStartDate: now };
@@ -802,7 +801,7 @@ function mapSelectedModelToGemini(modelName?: string): string {
 
 async function checkHistoryLimit(uid: string) {
   const user = await getUserUsage(uid);
-  if (user && user.email && ADMIN_EMAILS.includes(user.email.toLowerCase())) return true; // Unlimited for admin
+  if (user && isFounderEmail(user.email)) return true; // Unlimited strictly for Founder
   if (user && user.plan === 'PREMIUM') return true; // Unlimited for premium
 
   let count = 0;
@@ -1270,6 +1269,18 @@ async function startServer() {
         serverSelectionTimeoutMS: 15000,
       });
       console.log("[server] ✅ MongoDB connection established successfully! ReadyState:", mongoose.connection.readyState);
+      // Enforce strict single-Founder rule: demote any non-founder accounts previously marked ADMIN/ENTERPRISE_ADMIN
+      try {
+        const demoteRes = await User.updateMany(
+          { email: { $ne: FOUNDER_EMAIL }, plan: { $in: ["ADMIN", "ENTERPRISE_ADMIN"] } },
+          { $set: { plan: "FREE" } }
+        );
+        if (demoteRes.modifiedCount > 0) {
+          console.log(`[server] Normalized ${demoteRes.modifiedCount} non-founder account(s) back to standard USER plan.`);
+        }
+      } catch (normErr: any) {
+        console.warn("[server] User role normalization notice:", normErr?.message);
+      }
     } catch (err: any) {
       console.warn("[server] MongoDB connection attempt warning:", err.message || err);
       console.log("[server] Retrying MongoDB connection in 4 seconds...");
@@ -1347,15 +1358,16 @@ async function startServer() {
         updateUserUsage(uid, { 'usage.analysisCount': actualSavedCount }).catch(() => {});
       }
 
-      const isAdmin = user.email && ADMIN_EMAILS.includes(user.email.toLowerCase().trim());
-      const limit = (plan === 'PREMIUM' || isAdmin) ? 9999 : 3;
-      const availableCredits = (plan === 'PREMIUM' || isAdmin) ? 999 : Math.max(0, limit - currentCount);
+      const isAdmin = isFounderEmail(user.email);
+      const effectivePlan = isAdmin ? 'ADMIN' : (plan === 'PREMIUM' ? 'PREMIUM' : 'FREE');
+      const limit = (effectivePlan === 'PREMIUM' || isAdmin) ? 9999 : 3;
+      const availableCredits = (effectivePlan === 'PREMIUM' || isAdmin) ? 999 : Math.max(0, limit - currentCount);
       const resetDate = new Date(effectiveWindowStart.getTime() + 7 * 24 * 3600 * 1000);
       const tokensUsed = usage.tokensUsed || 0;
-      const tokenLimit = usage.tokenLimit || (plan === 'PREMIUM' || isAdmin ? 1000000 : 50000);
+      const tokenLimit = usage.tokenLimit || (effectivePlan === 'PREMIUM' || isAdmin ? 1000000 : 50000);
 
       res.json({
-        plan: isAdmin ? 'ADMIN' : plan,
+        plan: effectivePlan,
         analysisCount: currentCount,
         availableCredits: availableCredits,
         resetDate: resetDate.toISOString(),
@@ -1786,8 +1798,8 @@ async function startServer() {
       }
 
       const cleanEmail = email.trim().toLowerCase();
-      const isAdmin = ADMIN_EMAILS.includes(cleanEmail);
-      console.log(`[auth] Login request: ${cleanEmail} (isAdmin: ${isAdmin})`);
+      const isAdmin = isFounderEmail(cleanEmail);
+      console.log(`[auth] Login request: ${cleanEmail} (isFounder: ${isAdmin})`);
       
       let userDoc: any = null;
       if (mongoose.connection.readyState === 1) {
@@ -1913,7 +1925,8 @@ async function startServer() {
         }
       }
 
-      const token = jwt.sign({ uid: userDoc.uid, email: userDoc.email, plan: userDoc.plan, isAdmin }, JWT_SECRET, { expiresIn: '30d' });
+      const normalizedPlan = isAdmin ? 'ADMIN' : (userDoc.plan === 'PREMIUM' ? 'PREMIUM' : 'FREE');
+      const token = jwt.sign({ uid: userDoc.uid, email: userDoc.email, plan: normalizedPlan, isAdmin }, JWT_SECRET, { expiresIn: '30d' });
       res.json({
         token,
         user: {
@@ -1923,7 +1936,7 @@ async function startServer() {
           photoURL: userDoc.photoURL || '',
           xpPoints: userDoc.xpPoints,
           streak: userDoc.streak,
-          plan: userDoc.plan,
+          plan: normalizedPlan,
           isAdmin,
           emailVerified: true,
           preferences: userDoc.preferences
@@ -1941,14 +1954,14 @@ async function startServer() {
   app.get("/api/admin/users", authenticateToken, async (req: any, res: any) => {
     try {
       const userEmail = (req.user?.email || '').toLowerCase().trim();
-      const isAdmin = ADMIN_EMAILS.includes(userEmail) || req.user?.plan === 'ENTERPRISE_ADMIN' || req.user?.plan === 'ADMIN' || req.user?.isAdmin === true;
+      const isAdmin = isFounderEmail(userEmail);
       if (!isAdmin) {
         return res.status(403).json({ error: "Access denied. Admin only." });
       }
 
-      let allUsers = [];
+      let allUsers: any[] = [];
       if (isMongoConnected()) {
-        allUsers = await User.find({}, 'uid email displayName xpPoints streak plan createdAt');
+        allUsers = await User.find({}, 'uid email displayName xpPoints streak plan createdAt').lean();
       } else {
         allUsers = localDb.getAllUsers().map(u => ({
           uid: u.uid,
@@ -1959,6 +1972,10 @@ async function startServer() {
           plan: u.plan
         }));
       }
+      allUsers = allUsers.map((u: any) => ({
+        ...u,
+        plan: isFounderEmail(u.email) ? 'ADMIN' : (u.plan === 'PREMIUM' ? 'PREMIUM' : 'FREE')
+      }));
       res.json(allUsers);
     } catch (err: any) {
       res.status(500).json({ error: err.message });
@@ -1969,7 +1986,7 @@ async function startServer() {
   app.delete("/api/admin/users/:identifier", authenticateToken, async (req: any, res: any) => {
     try {
       const adminEmail = (req.user?.email || '').toLowerCase().trim();
-      const isAdmin = ADMIN_EMAILS.includes(adminEmail) || req.user?.plan === 'ENTERPRISE_ADMIN' || req.user?.plan === 'ADMIN' || req.user?.isAdmin === true;
+      const isAdmin = isFounderEmail(adminEmail) || req.user?.plan === 'ENTERPRISE_ADMIN' || req.user?.plan === 'ADMIN' || req.user?.isAdmin === true;
       if (!isAdmin) {
         return res.status(403).json({ error: "Access denied. Admin only." });
       }
@@ -1980,8 +1997,8 @@ async function startServer() {
         return res.status(400).json({ error: "User identifier (uid or email) is required." });
       }
 
-      // Safeguard: Never allow deleting the primary super-admins
-      if (ADMIN_EMAILS.includes(identifier.toLowerCase())) {
+      // Safeguard: Never allow deleting founder super-admins
+      if (isFounderEmail(identifier)) {
         return res.status(400).json({ error: "Protected Super Admin accounts cannot be deleted." });
       }
 
@@ -1996,7 +2013,7 @@ async function startServer() {
         });
 
         if (userDoc) {
-          if (ADMIN_EMAILS.includes((userDoc.email || '').toLowerCase())) {
+          if (isFounderEmail(userDoc.email || '')) {
             return res.status(400).json({ error: "Protected Super Admin accounts cannot be deleted." });
           }
           deletedUid = userDoc.uid;
@@ -2162,7 +2179,7 @@ async function startServer() {
   app.get("/api/admin/support/tickets", authenticateToken, async (req: any, res: any) => {
     try {
       const userEmail = (req.user?.email || '').toLowerCase().trim();
-      const isAdmin = ADMIN_EMAILS.includes(userEmail) || req.user?.plan === 'ENTERPRISE_ADMIN' || req.user?.plan === 'ADMIN' || req.user?.isAdmin === true;
+      const isAdmin = isFounderEmail(userEmail);
       if (!isAdmin) {
         return res.status(403).json({ error: "Access denied. Admin only." });
       }
@@ -2184,7 +2201,7 @@ async function startServer() {
   app.post("/api/admin/support/tickets/:ticketId/reply", authenticateToken, async (req: any, res: any) => {
     try {
       const userEmail = (req.user?.email || '').toLowerCase().trim();
-      const isAdmin = ADMIN_EMAILS.includes(userEmail) || req.user?.plan === 'ENTERPRISE_ADMIN' || req.user?.plan === 'ADMIN' || req.user?.isAdmin === true;
+      const isAdmin = isFounderEmail(userEmail);
       if (!isAdmin) {
         return res.status(403).json({ error: "Access denied. Admin only." });
       }
@@ -2295,7 +2312,7 @@ async function startServer() {
   app.get("/api/admin/errors", authenticateToken, async (req: any, res: any) => {
     try {
       const userEmail = (req.user?.email || '').toLowerCase().trim();
-      const isAdmin = ADMIN_EMAILS.includes(userEmail) || req.user?.plan === 'ENTERPRISE_ADMIN' || req.user?.plan === 'ADMIN' || req.user?.isAdmin === true;
+      const isAdmin = isFounderEmail(userEmail);
       if (!isAdmin) {
         return res.status(403).json({ error: "Access denied. Admin only." });
       }
@@ -2348,7 +2365,7 @@ async function startServer() {
   app.post("/api/admin/errors/:errorId/resolve", authenticateToken, async (req: any, res: any) => {
     try {
       const userEmail = (req.user?.email || '').toLowerCase().trim();
-      const isAdmin = ADMIN_EMAILS.includes(userEmail) || req.user?.plan === 'ENTERPRISE_ADMIN' || req.user?.plan === 'ADMIN' || req.user?.isAdmin === true;
+      const isAdmin = isFounderEmail(userEmail);
       if (!isAdmin) {
         return res.status(403).json({ error: "Access denied. Admin only." });
       }
@@ -2381,7 +2398,7 @@ async function startServer() {
   app.delete("/api/admin/errors/clear", authenticateToken, async (req: any, res: any) => {
     try {
       const userEmail = (req.user?.email || '').toLowerCase().trim();
-      const isAdmin = ADMIN_EMAILS.includes(userEmail) || req.user?.plan === 'ENTERPRISE_ADMIN' || req.user?.plan === 'ADMIN' || req.user?.isAdmin === true;
+      const isAdmin = isFounderEmail(userEmail);
       if (!isAdmin) {
         return res.status(403).json({ error: "Access denied. Admin only." });
       }
@@ -2505,6 +2522,9 @@ async function startServer() {
 
       if (!userDoc) return res.json({ user: null });
 
+      const isAdmin = isFounderEmail(userDoc.email);
+      const normalizedPlan = isAdmin ? 'ADMIN' : (userDoc.plan === 'PREMIUM' ? 'PREMIUM' : 'FREE');
+
       res.json({
         user: {
           uid: userDoc.uid,
@@ -2513,7 +2533,8 @@ async function startServer() {
           photoURL: userDoc.photoURL || '',
           xpPoints: userDoc.xpPoints,
           streak: userDoc.streak,
-          plan: userDoc.plan,
+          plan: normalizedPlan,
+          isAdmin,
           emailVerified: true,
           preferences: userDoc.preferences
         }
@@ -2769,7 +2790,7 @@ async function startServer() {
       } else {
         requestingUser = localDb.getUserByUid(uid);
       }
-      const isAdmin = !!(requestingUser?.email && ADMIN_EMAILS.includes(requestingUser.email.toLowerCase())) || uid === 'admin';
+      const isAdmin = isFounderEmail(requestingUser?.email);
 
       if (isMongoConnected()) {
         // Fetch user's resumes, ATS results, and roadmaps with lean parallel queries
@@ -2914,7 +2935,7 @@ async function startServer() {
         // If not matched by cleanUid, check if requesting user is admin or match without uid restriction
         if (resDel.deletedCount === 0) {
           const requestingUser = await User.findOne({ uid: cleanUid });
-          const isAdmin = !!(requestingUser?.email && ADMIN_EMAILS.includes(requestingUser.email.toLowerCase())) || cleanUid === 'admin';
+          const isAdmin = isFounderEmail(requestingUser?.email);
           if (isAdmin) {
             resDel = await Resume.deleteOne({ $or: idConditions });
           } else {
@@ -3197,7 +3218,60 @@ async function startServer() {
     { criterion: "Contact & Online Footprint", max: 5, keywords: ["contact", "footprint", "linkedin", "github", "online"] }
   ];
 
-  function normalizeAndVerifyAtsResult(rawAts: any, targetRole: string) {
+  function computeResumeTelemetry(rawText: string) {
+    const clean = (rawText || "").trim();
+    const lower = clean.toLowerCase();
+    const words = clean.split(/\s+/).filter(Boolean);
+    const wordCount = words.length;
+    const estimatedPages = Math.max(1, Math.round((wordCount / 450) * 10) / 10);
+
+    const lines = clean.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    const bulletLines = lines.filter(l => /^([•\-–—*]|\d+\.)\s+/.test(l) || (l.length >= 35 && l.length <= 260 && /^[A-Z]/.test(l) && /\s/.test(l)));
+    const bulletCount = bulletLines.length;
+    const quantifiedBullets = bulletLines.filter(l => /(\d+%|\$\d+|\d+\s*(ms|s|sec|x|k|m|b|\+|users|req|rps|qps|hrs|hours|days|months|weeks|clients|projects|endpoints))/i.test(l) || /\b\d+(\.\d+)?\b/.test(l)).length;
+    const quantifiedPercent = bulletCount > 0 ? Math.round((quantifiedBullets / bulletCount) * 100) : 0;
+
+    const strongVerbs = /^(built|architected|engineered|designed|developed|implemented|led|launched|optimized|reduced|increased|scaled|automated|deployed|migrated|created|delivered|spearheaded|streamlined|accelerated|orchestrated|integrated|established|improved)\b/i;
+    const strongVerbBullets = bulletLines.filter(l => strongVerbs.test(l.replace(/^([•\-–—*]|\d+\.)\s+/, ""))).length;
+
+    const weakPhrasesCatalog = ["responsible for", "worked on", "helped with", "assisted in", "assisted with", "duties included", "participated in", "tasked with", "involved in"];
+    const weakPhrasesFound = weakPhrasesCatalog.filter(p => lower.includes(p));
+
+    const clichesCatalog = ["hardworking", "team player", "detail-oriented", "detail oriented", "self-starter", "go-getter", "synergy", "results-driven", "passionate about"];
+    const clichesFound = clichesCatalog.filter(c => lower.includes(c));
+
+    const contact = {
+      email: /[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}/i.test(clean),
+      phone: /(\+?\d[\d\s\-()]{8,}\d)/.test(clean),
+      linkedin: /linkedin\.com/i.test(clean),
+      github: /github\.com/i.test(clean),
+      portfolio: /(https?:\/\/(?!(?:www\.)?(linkedin|github)\.com)[^\s]+)/i.test(clean)
+    };
+
+    const sectionsFound = {
+      summary: /(summary|objective|profile|about me)/i.test(clean),
+      experience: /(experience|employment|work history|internship)/i.test(clean),
+      projects: /\bprojects?\b/i.test(clean),
+      skills: /(skills|technologies|tech stack|competencies)/i.test(clean),
+      education: /(education|university|college|b\.?tech|b\.?e\.?|b\.?s\.?|m\.?s\.?|bca|mca|degree)/i.test(clean),
+      certifications: /(certification|certificate|license|award)/i.test(clean)
+    };
+
+    return {
+      wordCount,
+      estimatedPages,
+      bulletCount,
+      quantifiedBullets,
+      quantifiedPercent,
+      strongVerbBullets,
+      weakPhrasesFound,
+      clichesFound,
+      contact,
+      sectionsFound
+    };
+  }
+
+  function normalizeAndVerifyAtsResult(rawAts: any, targetRole: string, rawText: string = "", hasJd: boolean = false) {
     if (!rawAts || typeof rawAts !== "object") {
       throw new Error("Invalid ATS payload from Gemini AI");
     }
@@ -3205,7 +3279,6 @@ async function startServer() {
     if (rawBreakdown.length === 0) {
       throw new Error("Missing 8-factor ATS breakdown from Gemini AI");
     }
-
     const usedIndices = new Set<number>();
     const normalizedBreakdown = ATS_CRITERIA_SPEC.map((spec, idx) => {
       let matchedIdx = rawBreakdown.findIndex((b, bIdx) => {
@@ -3292,6 +3365,39 @@ async function startServer() {
           }))
       : [];
 
+    const matched_keywords = Array.isArray(rawAts.matched_keywords)
+      ? rawAts.matched_keywords.map((k: any) => String(k || "").trim()).filter(Boolean).slice(0, 18)
+      : [];
+
+    const missing_keywords = Array.isArray(rawAts.missing_keywords)
+      ? rawAts.missing_keywords
+          .filter((k: any) => k && (typeof k === "string" || k.keyword))
+          .slice(0, 12)
+          .map((k: any) =>
+            typeof k === "string"
+              ? { keyword: k.trim(), importance: "High" as const, suggestion: `Integrate "${k.trim()}" into Skills and a quantified Experience/Project bullet.` }
+              : {
+                  keyword: String(k.keyword || "").trim(),
+                  importance: (["Critical", "High", "Medium"].includes(k.importance) ? k.importance : "High") as "Critical" | "High" | "Medium",
+                  suggestion: String(k.suggestion || `Add "${k.keyword}" naturally to a relevant bullet or Skills section.`).trim()
+                }
+          )
+      : [];
+
+    const section_audit = Array.isArray(rawAts.section_audit)
+      ? rawAts.section_audit
+          .filter((s: any) => s && s.section)
+          .slice(0, 6)
+          .map((s: any) => ({
+            section: String(s.section).trim(),
+            status: (["Strong", "Needs Work", "Missing"].includes(s.status) ? s.status : "Needs Work") as "Strong" | "Needs Work" | "Missing",
+            scorePercent: Math.max(0, Math.min(100, Math.round(Number(s.scorePercent) || 60))),
+            feedback: String(s.feedback || "").trim()
+          }))
+      : [];
+
+    const telemetry = rawText ? computeResumeTelemetry(rawText) : undefined;
+
     return {
       evaluatedRole: targetRole,
       score: computedTotal,
@@ -3300,14 +3406,19 @@ async function startServer() {
       color,
       breakdown: normalizedBreakdown,
       priority_fixes,
-      bullet_rewrites
+      bullet_rewrites,
+      matched_keywords,
+      missing_keywords,
+      section_audit,
+      ...(telemetry ? { telemetry } : {}),
+      jd_match_mode: hasJd
     };
   }
 
-  // 2. ATS Score Endpoint - Target-Role Dependent, Strict 8-Factor 100-Point Engine (Zero Fallback)
+  // 2. ATS Score Endpoint - Target-Role + Optional JD Dependent, Strict 8-Factor 100-Point Engine (Zero Fallback)
   app.post("/api/resume/ats", authenticateToken, requireVerification, async (req, res) => {
     try {
-      const { text, jobTitle = "General", model, uid } = req.body;
+      const { text, jobTitle = "General", jobDescription = "", model, uid, resumeId } = req.body;
       if (!text) return res.status(400).json({ error: "Missing text for ATS score" });
 
       if (uid) {
@@ -3322,45 +3433,48 @@ async function startServer() {
         }
       }
 
+      const hasJd = typeof jobDescription === "string" && jobDescription.trim().length > 20;
+      const jdSection = hasJd
+        ? `\nTARGET JOB DESCRIPTION (MATCH RESUME STRICTLY AGAINST THIS JD TOO):\n"${jobDescription.trim().slice(0, 5000)}"\n`
+        : "";
+
       try {
         const response = await generateContentReliably({
           model: mapSelectedModelToGemini(model),
-          timeoutMs: 25000,
+          timeoutMs: 18000,
           contents: `You are a strict, enterprise-grade Applicant Tracking System (ATS) auditor and senior technical talent screener simulating Workday, Taleo, Greenhouse, Jobscan, and Resume Worded.
           
           TARGET ROLE TO AUDIT AGAINST (CRITICAL): "${jobTitle}"
-          
+          ${jdSection}
           TARGET-ROLE DEPENDENT SCORING REQUIREMENT:
-          - You MUST evaluate this candidate strictly against the exact requirements of "${jobTitle}".
-          - If the candidate's resume skills, experience, and projects align poorly with "${jobTitle}" (for example, an AI/Backend resume audited for "Frontend Developer", or vice versa), you MUST aggressively penalize "Core Technical Skills Match", "Experience Alignment & Tenure", and "Project Complexity & Code/Live Links" for "${jobTitle}"!
-          - Evaluating the same resume for two different target roles MUST produce genuinely different, role-accurate scores.
+          - You MUST evaluate this candidate strictly against the exact requirements of "${jobTitle}"${hasJd ? " and the Job Description above" : ""}.
+          - If the candidate's resume skills, experience, and projects align poorly with "${jobTitle}", aggressively penalize "Core Technical Skills Match", "Experience Alignment & Tenure", and "Project Complexity & Code/Live Links".
           
           STRICT CALIBRATION & DEDUCTION RULES (Total = 100 pts across 8 exact criteria):
-          1. Core Technical Skills Match (Max 25 pts): Score strictly how well the resume's skills/tools match 2026 production requirements for "${jobTitle}". Deduct 10-18 pts if core "${jobTitle}" keywords/frameworks are absent.
-          2. Measurable Impact & Quantified Metrics (Max 20 pts): Severe deduction for bullet points without numbers (%, $, latency, users, throughput, time saved). Descriptive bullets without numerical KPIs receive max 4/20!
-          3. Experience Alignment & Tenure (Max 15 pts): Evaluate relevance and depth of experience specifically toward "${jobTitle}". Deduct heavily if titles/duties belong to a different track.
-          4. Action Verbs & Linguistic Precision (Max 10 pts): Deduct 4-7 pts for weak/passive phrasing ("responsible for", "worked on", "helped with", "assisted").
-          5. Project Complexity & Code/Live Links (Max 10 pts): Deduct 4-8 pts if projects lack complexity relevant to "${jobTitle}", GitHub links, or live deployed URLs.
-          6. ATS Formatting & Parsing Robustness (Max 10 pts): Deduct 3-7 pts for non-standard section headers, dense walls of text, or parsing friction.
-          7. Education & Credentials (Max 5 pts): Score degree relevance & certifications for "${jobTitle}".
-          8. Contact & Online Footprint (Max 5 pts): Score presence of Email, Phone, LinkedIn, GitHub, or Portfolio links.
+          1. Core Technical Skills Match (Max 25 pts)
+          2. Measurable Impact & Quantified Metrics (Max 20 pts) — Unquantified bullets earn max 4/20.
+          3. Experience Alignment & Tenure (Max 15 pts)
+          4. Action Verbs & Linguistic Precision (Max 10 pts)
+          5. Project Complexity & Code/Live Links (Max 10 pts)
+          6. ATS Formatting & Parsing Robustness (Max 10 pts)
+          7. Education & Credentials (Max 5 pts)
+          8. Contact & Online Footprint (Max 5 pts)
           
           MATHEMATICAL INTEGRITY:
           - Total "score" MUST equal the exact sum of the 8 breakdown scores.
           - Label calibration: 0-48: "Critical ATS Risk", 49-62: "Needs Optimization", 63-74: "Moderate Fit", 75-84: "Competitive Match", 85-100: "Top 5% Candidate".
           
-          ACTIONABLE PRIORITY FIXES (5 to 8 items):
-          - Return between 5 and 8 specific, high-priority fixes.
-          - Each fix MUST quote or cite exact bullet points, project names, or missing "${jobTitle}" keywords directly from the candidate's resume below.
+          REQUIRED DEEP DIAGNOSTICS:
+          - "matched_keywords": 8 to 16 exact skills/keywords for "${jobTitle}" verified present in this resume.
+          - "missing_keywords": 6 to 10 critical ATS keywords for "${jobTitle}"${hasJd ? " / the JD" : ""} missing from the resume, each with importance ("Critical" | "High" | "Medium") and placement suggestion.
+          - "section_audit": Audit all 6 sections ("Contact & Links", "Summary / Objective", "Experience", "Projects", "Technical Skills", "Education") with status ("Strong" | "Needs Work" | "Missing"), scorePercent (0-100), and specific feedback.
+          - "priority_fixes": 5 to 8 resume-specific fixes quoting exact bullets, projects, or missing keywords.
+          - "bullet_rewrites": 3 weak bullets quoted verbatim in "before" and rewritten with Google XYZ formula ("Accomplished [X] as measured by [Y] by doing [Z]") in "after".
           
-          BEFORE vs AFTER XYZ BULLET REWRITE LAB (Minimum 2 rewrites):
-          - Pick at least 2 weak or unquantified bullet points directly from the candidate's resume (quote them verbatim in "before").
-          - Rewrite each using the Google XYZ formula: "Accomplished [X] as measured by [Y] by doing [Z]" tailored for "${jobTitle}".
+          Candidate Resume:
+          "${text.slice(0, 14000)}"
           
-          Evaluate this candidate's resume text:
-          "${text.slice(0, 16000)}"
-          
-          Return ONLY a valid JSON object matching this exact schema:
+          Return ONLY valid JSON matching:
           {
             "evaluatedRole": "${jobTitle}",
             "score": number,
@@ -3377,22 +3491,11 @@ async function startServer() {
               { "criterion": "Education & Credentials", "score": number, "max": 5, "fix": string },
               { "criterion": "Contact & Online Footprint", "score": number, "max": 5, "fix": string }
             ],
-            "priority_fixes": [
-              {
-                "problem": string,
-                "impact": string,
-                "fix": string,
-                "severity": "Critical" | "High" | "Medium" | "Low"
-              }
-            ],
-            "bullet_rewrites": [
-              {
-                "section": string,
-                "before": string,
-                "after": string,
-                "reason": string
-              }
-            ]
+            "matched_keywords": string[],
+            "missing_keywords": [{ "keyword": string, "importance": "Critical" | "High" | "Medium", "suggestion": string }],
+            "section_audit": [{ "section": string, "status": "Strong" | "Needs Work" | "Missing", "scorePercent": number, "feedback": string }],
+            "priority_fixes": [{ "problem": string, "impact": string, "fix": string, "severity": "Critical" | "High" | "Medium" | "Low" }],
+            "bullet_rewrites": [{ "section": string, "before": string, "after": string, "reason": string }]
           }`,
           config: {
             responseMimeType: "application/json",
@@ -3401,7 +3504,28 @@ async function startServer() {
         });
 
         const parsedRaw = JSON.parse(cleanJSONResponse(response.text || "{}"));
-        const verifiedAts = normalizeAndVerifyAtsResult(parsedRaw, jobTitle);
+        const verifiedAts = normalizeAndVerifyAtsResult(parsedRaw, jobTitle, text, hasJd);
+
+        // Optionally persist re-audit to DB if resumeId & uid provided
+        if (resumeId && uid) {
+          try {
+            if (isMongoConnected()) {
+              await Promise.all([
+                AtsResult.findOneAndUpdate(
+                  { userId: uid, resumeId },
+                  { $set: { ...verifiedAts, createdAt: new Date() } },
+                  { upsert: true, new: true }
+                ),
+                Resume.updateOne({ _id: resumeId, userId: uid }, { $set: { targetRole: jobTitle } }).catch(() => {})
+              ]);
+            } else {
+              localDb.saveAtsResult({ userId: uid, resumeId, ...verifiedAts });
+            }
+          } catch (persistErr: any) {
+            console.warn("[server] Re-audit persist notice:", persistErr?.message);
+          }
+        }
+
         res.json(verifiedAts);
       } catch (aiError: any) {
         console.error("[server] [AI Error] ATS scoring failed:", aiError?.message || aiError);
@@ -3410,7 +3534,7 @@ async function startServer() {
           severity: 'CRITICAL',
           component: 'ATS Scoring Engine',
           userId: uid,
-          message: `ATS audit failed for role "${jobTitle}": ${aiError?.message || aiError}`
+          message: `ATS audit failed for role "${jobTitle}": ${aiError?.message || aiErrMsg(aiError)}`
         });
         res.status(503).json({ 
           error: "Gemini AI ATS audit timed out or is temporarily unavailable. Please click Retry — we never return fake fallback scores.",
@@ -3426,6 +3550,10 @@ async function startServer() {
       });
     }
   });
+
+  function aiErrMsg(e: any) {
+    return e?.message || String(e || "unknown");
+  }
 
   // 3. Generate Roadmap & Skill Gap Report Endpoint
   app.post("/api/resume/roadmap", authenticateToken, requireVerification, async (req, res) => {
@@ -3918,36 +4046,38 @@ Return valid JSON with format:
       const resumeSnippet = text.slice(0, 6000);
       console.log(`[server] [Analysis] Launching parallel Stage 1-5 Gemini execution for "${role}"...`);
 
+      const providedParsedData = req.body.parsedData && typeof req.body.parsedData === 'object' ? req.body.parsedData : null;
       const stage12Prompt = `
         Perform a rigorous, enterprise-grade, TARGET-ROLE DEPENDENT ATS (Applicant Tracking System) audit of this resume specifically for the target role: "${role}".
         Simulate top industry parsers like Workday, Taleo, Greenhouse, Jobscan, and Resume Worded.
         
         CRITICAL TARGET-ROLE CALIBRATION RULES:
-        1. ROLE-SPECIFIC EVALUATION: You MUST score strictly based on how well this resume matches "${role}". If the candidate's experience and stack do not match "${role}", score Core Technical Skills Match and Experience Alignment & Tenure low accordingly. Evaluating the same resume for different roles MUST yield distinct, role-accurate scores.
-        2. STRICT DEDUCTIONS ACROSS 8 WEIGHTED CRITERIA (Max 100 pts total):
-           1. Core Technical Skills Match (Max 25 pts) — Deduct 10-18 pts if key 2026 skills/frameworks for "${role}" are missing.
-           2. Measurable Impact & Quantified Metrics (Max 20 pts) — Severe deductions for text without numbers (%, $, latency, scale). Unquantified bullets earn max 4/20.
-           3. Experience Alignment & Tenure (Max 15 pts) — Relevance & seniority progression specifically for "${role}".
-           4. Action Verbs & Linguistic Precision (Max 10 pts) — Deduct for weak/passive phrasing ("worked on", "helped with", "responsible for").
-           5. Project Complexity & Code/Live Links (Max 10 pts) — Technical complexity for "${role}" + verified GitHub/live deployment URLs.
-           6. ATS Formatting & Parsing Robustness (Max 10 pts) — Clean sections, standard headings, low parser friction.
-           7. Education & Credentials (Max 5 pts) — Degrees & relevant certifications.
-           8. Contact & Online Footprint (Max 5 pts) — Email, phone, LinkedIn, GitHub/portfolio URLs.
-        3. SCORE INTEGRITY: Sum of all 8 criteria MUST equal "score".
+        1. ROLE-SPECIFIC EVALUATION: Score strictly based on how well this resume matches "${role}". Different roles MUST yield distinct, role-accurate scores.
+        2. STRICT 8 WEIGHTED CRITERIA (Max 100 pts total, sum MUST equal "score"):
+           - Core Technical Skills Match (Max 25 pts)
+           - Measurable Impact & Quantified Metrics (Max 20 pts — unquantified bullets max 4/20)
+           - Experience Alignment & Tenure (Max 15 pts)
+           - Action Verbs & Linguistic Precision (Max 10 pts)
+           - Project Complexity & Code/Live Links (Max 10 pts)
+           - ATS Formatting & Parsing Robustness (Max 10 pts)
+           - Education & Credentials (Max 5 pts)
+           - Contact & Online Footprint (Max 5 pts)
            Labels: 0-48: "Critical ATS Risk", 49-62: "Needs Optimization", 63-74: "Moderate Fit", 75-84: "Competitive Match", 85-100: "Top 5% Candidate".
-        4. PRIORITY FIXES (5 to 8 specific fixes):
-           Cite exact bullet points, project names, or missing "${role}" keywords directly from this resume.
-        5. BEFORE vs AFTER XYZ BULLET REWRITES (Minimum 2):
-           Extract at least 2 weak bullet points verbatim from this resume and rewrite them using the Google XYZ formula: "Accomplished [X] as measured by [Y] by doing [Z]" aligned to "${role}".
+        3. DEEP DIAGNOSTICS:
+           - "matched_keywords": 8 to 14 core "${role}" skills/keywords verified in the resume.
+           - "missing_keywords": 6 to 10 high-impact "${role}" ATS keywords missing from the resume (with importance & placement suggestion).
+           - "section_audit": Audit all 6 sections ("Contact & Links", "Summary / Objective", "Experience", "Projects", "Technical Skills", "Education") with status ("Strong" | "Needs Work" | "Missing"), scorePercent (0-100), and concise feedback.
+           - "priority_fixes": 5 to 8 resume-specific fixes citing exact bullets, projects, or missing "${role}" keywords.
+           - "bullet_rewrites": 3 weak bullets verbatim from the resume rewritten using Google XYZ formula ("Accomplished [X] as measured by [Y] by doing [Z]").
 
-        Return ONLY a valid JSON object matching this exact schema:
+        Return ONLY a valid JSON object matching this schema:
         {
-          "parsedData": {
+          ${providedParsedData ? '' : `"parsedData": {
             "skills": string[],
             "experience": [{"role": string, "company": string, "years": number, "bullets": string[]}],
             "education": [{"degree": string, "institute": string, "year": number}],
             "projects": [{"name": string, "tech": string[], "desc": string}]
-          },
+          },`}
           "atsResult": {
             "evaluatedRole": "${role}",
             "score": number,
@@ -3964,6 +4094,9 @@ Return valid JSON with format:
               { "criterion": "Education & Credentials", "score": number, "max": 5, "fix": string },
               { "criterion": "Contact & Online Footprint", "score": number, "max": 5, "fix": string }
             ],
+            "matched_keywords": string[],
+            "missing_keywords": [{ "keyword": string, "importance": "Critical" | "High" | "Medium", "suggestion": string }],
+            "section_audit": [{ "section": string, "status": "Strong" | "Needs Work" | "Missing", "scorePercent": number, "feedback": string }],
             "priority_fixes": [
               { "problem": string, "impact": string, "fix": string, "severity": "Critical" | "High" | "Medium" | "Low" }
             ],
@@ -3972,14 +4105,13 @@ Return valid JSON with format:
             ]
           }
         }
-        Resume: ${text.slice(0, 16000)}
+        Resume: ${text.slice(0, 14000)}
       `;
 
       const stage34Prompt = `
         As a Career Intelligence AI, conduct Market Research and Structural Gap Analysis for a "${role}" in "${targetRegion}".
-        
-        Stage 3 (Market Data Synthesis): Pull real-time 2026 salary benchmarks, hiring demand trends, and top skill requirements.
-        Stage 4 (Structural Gap Analysis): Compare the candidate's resume below against top-tier "${role}" requirements and isolate missing skills for a Strong match.
+        Stage 3 (Market Data Synthesis): 2026 salary benchmarks, hiring demand, top skill requirements.
+        Stage 4 (Structural Gap Analysis): Compare the candidate's resume below against top-tier "${role}" requirements and isolate missing skills.
         
         Candidate Resume:
         ${resumeSnippet}
@@ -4009,18 +4141,18 @@ Return valid JSON with format:
       `;
 
       const stage5Prompt = `
-        Generate a 6-month specialized "Career Flight Path" to help this candidate become a top-tier "${role}" in "${targetRegion}", prioritizing the biggest gaps visible in their resume.
+        Generate a concise, high-impact 4-Sprint "Career Flight Path" (covering Months 1-6) to help this candidate excel as a "${role}" in "${targetRegion}", targeting the biggest gaps in their resume. Keep task titles and details crisp.
         
         Candidate Resume:
         ${resumeSnippet}
         
-        Return a valid JSON object for a Roadmap:
+        Return a valid JSON object:
         {
           "title": "Learning Roadmap for ${role}",
           "sprints": [
             {
               "sprint_number": 1,
-              "theme": "Core Foundations & Architecture",
+              "theme": string,
               "weeks": [
                 {
                   "week": 1,
@@ -4070,10 +4202,13 @@ Return valid JSON with format:
       ]);
 
       const stage12Data = JSON.parse(cleanJSONResponse(stage12Result.text || "{}"));
+      if (providedParsedData && !stage12Data.parsedData) {
+        stage12Data.parsedData = providedParsedData;
+      }
       if (!stage12Data?.atsResult || !Array.isArray(stage12Data?.atsResult?.breakdown) || stage12Data.atsResult.breakdown.length === 0) {
         throw new Error("Invalid 8-factor ATS structure returned by Gemini AI");
       }
-      stage12Data.atsResult = normalizeAndVerifyAtsResult(stage12Data.atsResult, role);
+      stage12Data.atsResult = normalizeAndVerifyAtsResult(stage12Data.atsResult, role, text, false);
 
       const stage34Data = JSON.parse(cleanJSONResponse(stage34Result.text || "{}"));
       if (!stage34Data?.marketAnalysis || !stage34Data?.gapAnalysis) {
@@ -4197,6 +4332,14 @@ Return valid JSON with format:
       }
 
       const buffer = Buffer.from(base64, 'base64');
+      const fileHash = crypto.createHash('sha256').update(buffer).digest('hex');
+      const parseCacheKey = `parse-text:${fileHash}`;
+      const cachedParsed = getCachedAiResponse(parseCacheKey);
+      if (cachedParsed) {
+        console.log(`[server] [Document Parser] Instant hash-cache hit (${fileHash.slice(0, 10)})`);
+        return res.json(cachedParsed);
+      }
+
       let text = "";
       let extractionMethod = "direct";
       const ext = (filename || '').split('.').pop()?.toLowerCase() || '';
@@ -4369,7 +4512,7 @@ Transcribe all readable information into clean, complete text formatted by secti
         console.log(`[server] [AI Document Analysis] Running deep evidence-based role & profile indexing (${text.length} chars)...`);
         const aiAnalysis = await generateContentReliably({
           model: "gemini-3.1-flash-lite",
-          timeoutMs: 22000,
+          timeoutMs: 16000,
           contents: `You are an elite executive technical & non-technical career strategist and ATS profiler.
 Carefully read EVERY section of the candidate's resume below before making any decision.
 
@@ -4483,7 +4626,7 @@ Return ONLY a valid JSON object matching this exact schema:
       }
 
       console.log(`[server] [Document Parser] Returning AI-verified resume (${text.length} chars, role: ${detectedRole}).`);
-      res.json({
+      const parsePayload = {
         text,
         extractionMethod,
         detectedRole,
@@ -4503,7 +4646,9 @@ Return ONLY a valid JSON object matching this exact schema:
           education: parsedEducation,
           keywords: parsedSkills
         }
-      });
+      };
+      setCachedAiResponse(parseCacheKey, parsePayload);
+      res.json(parsePayload);
     } catch (globalErr: any) {
       console.error("[server] [Document Parser] Error processing document:", globalErr.message || globalErr);
       res.status(500).json({ error: globalErr.message || "Failed to process uploaded document." });
@@ -4920,8 +5065,8 @@ Return ONLY a valid JSON object matching this exact schema:
         attachmentsContext += "Instructions: Provide clear, expert guidance on the user's question regarding these uploaded documents/images. Analyze any resume, code snippet, certificate, or image details provided.\n";
       }
 
-      // Token Limit Check (Admins exempt)
-      const isAdmin = !!(user.email && ADMIN_EMAILS.includes(user.email.toLowerCase().trim()));
+      // Token Limit Check (Official Founder exempt)
+      const isAdmin = isFounderEmail(user.email);
       const usage = user.usage || {};
       const tokensUsed = usage.tokensUsed || 0;
       const tokenLimit = usage.tokenLimit || 50000;

@@ -66,6 +66,11 @@ const AtsResultSchema = new mongoose.Schema({
   top_3_fixes: { type: [String], default: [] },
   priority_fixes: { type: [mongoose.Schema.Types.Mixed], default: [] },
   bullet_rewrites: { type: [mongoose.Schema.Types.Mixed], default: [] },
+  matched_keywords: { type: [String], default: [] },
+  missing_keywords: { type: [mongoose.Schema.Types.Mixed], default: [] },
+  section_audit: { type: [mongoose.Schema.Types.Mixed], default: [] },
+  telemetry: { type: mongoose.Schema.Types.Mixed, default: {} },
+  jd_match_mode: { type: Boolean, default: false },
   createdAt: { type: Date, default: Date.now }
 });
 AtsResultSchema.index({ userId: 1, resumeId: 1, createdAt: -1 });
