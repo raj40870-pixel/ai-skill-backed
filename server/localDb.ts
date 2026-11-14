@@ -232,16 +232,19 @@ export const localDb = {
   
   saveAtsResult(atsResult: any) {
     const db = readDb();
-    const finalFixes = atsResult.top_3_fixes || atsResult.priority_fixes || [];
+    const finalFixes = atsResult.priority_fixes || atsResult.top_3_fixes || [];
     const serialized = {
       _id: atsResult._id || `ats_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
       userId: atsResult.userId,
       resumeId: atsResult.resumeId,
+      evaluatedRole: atsResult.evaluatedRole || '',
       score: atsResult.score,
       market_match: atsResult.market_match || 0,
       label: atsResult.label,
       color: atsResult.color,
       breakdown: atsResult.breakdown || [],
+      priority_fixes: Array.isArray(atsResult.priority_fixes) ? atsResult.priority_fixes : [],
+      bullet_rewrites: Array.isArray(atsResult.bullet_rewrites) ? atsResult.bullet_rewrites : [],
       top_3_fixes: Array.isArray(finalFixes) ? (typeof finalFixes[0] === 'object' ? finalFixes.map((f: any) => f.fix || f.problem) : finalFixes) : [],
       createdAt: atsResult.createdAt || new Date().toISOString()
     };

@@ -521,7 +521,7 @@ async function generateContentReliably(options: {
   config?: any;
   timeoutMs?: number;
 }): Promise<any> {
-  const timeoutMs = options.timeoutMs || 20000; // Increased default timeout to 20000ms
+  const timeoutMs = options.timeoutMs || 20000; // 20 seconds per attempt for full resume analysis
   const now = Date.now();
   
   if (now < quotaCircuitBreakerUntil) {
@@ -529,16 +529,21 @@ async function generateContentReliably(options: {
     console.log(`[server] [Circuit Breaker Active] Attempting quick recovery (${remainingSec}s remaining)...`);
   }
 
-  // Active verified Google production models list - prioritize fast, healthy production models
+  // Verified active production Gemini model order (gemini-3.1-flash-lite is fastest & healthy across pool)
   const availableFallbacks = [
     "gemini-3.1-flash-lite",
-    "gemini-3.8-flash",
-    "gemini-flash-latest"
+    "gemini-3.8-flash"
   ];
 
   const modelsToTry: string[] = [];
   if (options.model) {
-    modelsToTry.push(options.model);
+    // Prefer gemini-3.1-flash-lite ahead of overloaded models
+    if (options.model === "gemini-3.8-flash" || options.model === "gemini-flash-latest") {
+      modelsToTry.push("gemini-3.1-flash-lite");
+    }
+    if (!modelsToTry.includes(options.model)) {
+      modelsToTry.push(options.model);
+    }
   }
   for (const m of availableFallbacks) {
     if (!modelsToTry.includes(m)) {
@@ -558,92 +563,74 @@ async function generateContentReliably(options: {
     const keyPreview = key ? `${key.substring(0, 6)}...${key.slice(-4)}` : "None";
     console.log(`[server] [AI Multi-Key] Selected Key ${keyIndex}/${poolSize} (${keyPreview}) for attempt ${keyAttempt + 1}`);
 
-    let keyHitHardError = false;
+    let rotateKeyImmediately = false;
 
     for (const currentModel of modelsToTry) {
-      for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        console.log(`[server] [AI Attempt] Model: ${currentModel} (key: ${keyPreview}, timeout: ${timeoutMs}ms)`);
+        
+        const apiCall = client.models.generateContent({
+          ...options,
+          model: currentModel,
+        });
+
+        const timeoutPromise = new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(`AI Request Timeout after ${Math.round(timeoutMs / 1000)}s`)), timeoutMs)
+        );
+
+        return await Promise.race([apiCall, timeoutPromise]);
+      } catch (error: any) {
+        lastError = error;
+        
+        const rawMessage = error?.message || '';
+        const rawStatus = String(error?.status || error?.statusCode || error?.code || '');
+        const rawString = String(error || '');
+        let errorProps = '';
         try {
-          console.log(`[server] [AI Attempt] Model: ${currentModel} (attempt ${attempt}/2, key: ${keyPreview}, timeout: ${timeoutMs}ms)`);
-          
-          const apiCall = client.models.generateContent({
-            ...options,
-            model: currentModel,
-          });
+          errorProps = JSON.stringify(error, Object.getOwnPropertyNames(error));
+        } catch {
+          errorProps = '';
+        }
+        const errorDetails = [rawMessage, rawStatus, rawString, errorProps].join(' ');
 
-          const timeoutPromise = new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error(`AI Request Timeout after ${Math.round(timeoutMs / 1000)}s`)), timeoutMs)
-          );
+        const isQuotaError = errorDetails.includes("429") || 
+                             errorDetails.includes("RESOURCE_EXHAUSTED") || 
+                             errorDetails.includes("quota") ||
+                             errorDetails.includes("rate limit");
 
-          return await Promise.race([apiCall, timeoutPromise]);
-        } catch (error: any) {
-          lastError = error;
-          
-          // 1. Robust Error String Extraction:
-          const rawMessage = error?.message || '';
-          const rawStatus = String(error?.status || error?.statusCode || error?.code || '');
-          const rawString = String(error || '');
-          let errorProps = '';
-          try {
-            errorProps = JSON.stringify(error, Object.getOwnPropertyNames(error));
-          } catch {
-            errorProps = '';
-          }
-          const errorDetails = [rawMessage, rawStatus, rawString, errorProps].join(' ');
+        const isPermissionError = errorDetails.includes("403") || 
+                                  errorDetails.includes("PERMISSION_DENIED") || 
+                                  errorDetails.includes("API_KEY_INVALID") ||
+                                  errorDetails.includes("API key not valid");
 
-          const isQuotaError = errorDetails.includes("429") || 
-                               errorDetails.includes("RESOURCE_EXHAUSTED") || 
-                               errorDetails.includes("quota") ||
-                               errorDetails.includes("rate limit");
+        const isTimeoutOrNetwork = errorDetails.includes("Timeout") ||
+                                   errorDetails.includes("ECONNRESET") ||
+                                   errorDetails.includes("fetch failed");
 
-          const isPermissionError = errorDetails.includes("403") || 
-                                    errorDetails.includes("PERMISSION_DENIED") || 
-                                    errorDetails.includes("API_KEY_INVALID") ||
-                                    errorDetails.includes("API key not valid");
+        console.warn(`[server] [AI Attempt Note] Model ${currentModel} (key: ${keyPreview}): ${rawMessage || errorDetails.substring(0, 150)}`);
 
-          const isTimeoutOrNetwork = rawMessage.includes("Timeout") ||
-                                     errorDetails.includes("ETIMEDOUT") ||
-                                     errorDetails.includes("ECONNRESET") ||
-                                     errorDetails.includes("fetch failed") ||
-                                     errorDetails.includes("network");
-
-          const isUnavailable = errorDetails.includes("503") || 
-                               errorDetails.includes("UNAVAILABLE") || 
-                               errorDetails.includes("high demand") || 
-                               errorDetails.includes("temporarily overloaded");
-
-          console.warn(`[server] [AI Attempt Note] Model ${currentModel} (key: ${keyPreview}): ${rawMessage || errorDetails.substring(0, 150)}`);
-
-          // 2. Immediate Instant Key Failover (No Model Looping on Bad or Stalled Keys):
-          if (isQuotaError || isPermissionError || isTimeoutOrNetwork) {
-            keyHitHardError = true;
-            const cooldownDuration = (isQuotaError || isPermissionError) ? 120000 : 45000;
-            // Put that key on cooldown in keyCooldowns
-            if (key) {
-              keyCooldowns.set(key, Date.now() + cooldownDuration);
-              exhaustedKeys.add(key);
-              console.warn(`[server] [AI Multi-Key Failover] Key ${keyPreview} hit ${isQuotaError ? 'quota (429)' : isPermissionError ? 'permission (403)' : 'timeout/network error'}. Cooldown ${Math.round(cooldownDuration / 1000)}s set. Immediately rotating to next key in pool.`);
+        // Rotate immediately on quota, permission, or slow/timeout errors so we never stall on one bad key
+        if (isQuotaError || isPermissionError || isTimeoutOrNetwork) {
+          rotateKeyImmediately = true;
+          if (key) {
+            keyCooldowns.set(key, Date.now() + (isTimeoutOrNetwork ? 45000 : 120000));
+            exhaustedKeys.add(key);
+            console.warn(`[server] [AI Multi-Key Failover] Key ${keyPreview} hit ${isQuotaError ? 'quota (429)' : isPermissionError ? 'permission (403)' : 'timeout'}. Rotating to next healthy key.`);
+            if (isQuotaError || isPermissionError) {
               logServerSystemError({
-                type: isQuotaError ? 'GEMINI_QUOTA' : isPermissionError ? 'API_FAILURE' : 'API_FAILURE',
-                severity: isPermissionError ? 'CRITICAL' : 'WARNING',
+                type: isQuotaError ? 'GEMINI_QUOTA' : 'API_FAILURE',
+                severity: isQuotaError ? 'WARNING' : 'CRITICAL',
                 component: 'Gemini Multi-Key Pool',
-                message: `Gemini Key ${keyPreview} error: ${rawMessage.slice(0, 150)}`
+                message: `Gemini Key ${keyPreview} returned ${isQuotaError ? '429 Quota Exceeded' : '403 Permission Denied'}: ${rawMessage.slice(0, 150)}`
               });
             }
-            break; // Break completely out of the inner model loop!
           }
-
-          // If 503 unavailable on attempt 1, brief 500ms pause then retry once
-          if (isUnavailable && attempt === 1) {
-            await new Promise(r => setTimeout(r, 500));
-            continue;
-          }
-
-          break; // Try next model in list for this key
+          break;
         }
       }
 
-      if (keyHitHardError) {
-        break; // Stop trying models with this stalled/bad key, rotate to next key in pool immediately
+      if (rotateKeyImmediately) {
+        break;
       }
     }
 
@@ -2904,21 +2891,39 @@ async function startServer() {
 
   app.post("/api/users/:uid/atsResults", async (req, res) => {
     try {
-      const { uid } = req.params;
-      const { score, label, color, breakdown, top_3_fixes, priority_fixes, resumeId } = req.body;
+      const {
+        uid,
+      } = req.params;
+      const {
+        score,
+        market_match,
+        evaluatedRole,
+        label,
+        color,
+        breakdown,
+        top_3_fixes,
+        priority_fixes,
+        bullet_rewrites,
+        resumeId
+      } = req.body;
       
-      // Handle both naming conventions for fixes
-      const finalFixes = top_3_fixes || priority_fixes || [];
+      const normalizedPriorityFixes = Array.isArray(priority_fixes) ? priority_fixes : [];
+      const finalFixes = normalizedPriorityFixes.length > 0 ? normalizedPriorityFixes : (top_3_fixes || []);
+      const normalizedRewrites = Array.isArray(bullet_rewrites) ? bullet_rewrites : [];
       
       if (isMongoConnected()) {
-        console.log(`[server] [History] Saving ATS result for user ${uid}, Resume: ${resumeId}`);
+        console.log(`[server] [History] Saving ATS result for user ${uid}, Resume: ${resumeId}, Role: ${evaluatedRole || 'N/A'}`);
         const newAts = new AtsResult({
           userId: uid,
           resumeId,
+          evaluatedRole: evaluatedRole || '',
           score,
+          market_match: market_match || 0,
           label,
           color,
           breakdown,
+          priority_fixes: normalizedPriorityFixes,
+          bullet_rewrites: normalizedRewrites,
           top_3_fixes: Array.isArray(finalFixes) ? (typeof finalFixes[0] === 'object' ? finalFixes.map((f: any) => f.fix || f.problem) : finalFixes) : [],
           createdAt: new Date()
         });
@@ -2937,10 +2942,14 @@ async function startServer() {
         const savedAts = localDb.saveAtsResult({
           userId: uid,
           resumeId,
+          evaluatedRole: evaluatedRole || '',
           score,
+          market_match: market_match || 0,
           label,
           color,
           breakdown,
+          priority_fixes: normalizedPriorityFixes,
+          bullet_rewrites: normalizedRewrites,
           top_3_fixes
         });
         res.json(savedAts);
@@ -3092,7 +3101,125 @@ async function startServer() {
     }
   });
 
-  // 2. ATS Score Endpoint - Overhauled to analyze real current market hireability
+  const ATS_CRITERIA_SPEC: Array<{ criterion: string; max: number; keywords: string[] }> = [
+    { criterion: "Core Technical Skills Match", max: 25, keywords: ["skill", "technical", "keyword", "stack"] },
+    { criterion: "Measurable Impact & Quantified Metrics", max: 20, keywords: ["impact", "metric", "quantif", "kpi"] },
+    { criterion: "Experience Alignment & Tenure", max: 15, keywords: ["experience", "tenure", "seniority", "alignment"] },
+    { criterion: "Action Verbs & Linguistic Precision", max: 10, keywords: ["verb", "linguistic", "phrasing", "action"] },
+    { criterion: "Project Complexity & Code/Live Links", max: 10, keywords: ["project", "complex", "code", "live", "link"] },
+    { criterion: "ATS Formatting & Parsing Robustness", max: 10, keywords: ["format", "pars", "structur", "heading"] },
+    { criterion: "Education & Credentials", max: 5, keywords: ["education", "degree", "credential", "certif"] },
+    { criterion: "Contact & Online Footprint", max: 5, keywords: ["contact", "footprint", "linkedin", "github", "online"] }
+  ];
+
+  function normalizeAndVerifyAtsResult(rawAts: any, targetRole: string) {
+    if (!rawAts || typeof rawAts !== "object") {
+      throw new Error("Invalid ATS payload from Gemini AI");
+    }
+    const rawBreakdown: any[] = Array.isArray(rawAts.breakdown) ? rawAts.breakdown : [];
+    if (rawBreakdown.length === 0) {
+      throw new Error("Missing 8-factor ATS breakdown from Gemini AI");
+    }
+
+    const usedIndices = new Set<number>();
+    const normalizedBreakdown = ATS_CRITERIA_SPEC.map((spec, idx) => {
+      let matchedIdx = rawBreakdown.findIndex((b, bIdx) => {
+        if (usedIndices.has(bIdx) || !b?.criterion) return false;
+        const lower = String(b.criterion).toLowerCase();
+        return spec.keywords.some(kw => lower.includes(kw));
+      });
+      if (matchedIdx === -1 && idx < rawBreakdown.length && !usedIndices.has(idx)) {
+        matchedIdx = idx;
+      }
+      if (matchedIdx !== -1) usedIndices.add(matchedIdx);
+
+      const entry = matchedIdx !== -1 ? rawBreakdown[matchedIdx] : null;
+      let rawVal = Number(entry?.score);
+      if (Number.isNaN(rawVal)) rawVal = 0;
+
+      // Handle case where model mistakenly returned a 0-100 percentage instead of weighted points
+      const entryMax = Number(entry?.max);
+      if (entryMax === 100 && spec.max !== 100 && rawVal > spec.max) {
+        rawVal = Math.round((rawVal / 100) * spec.max);
+      }
+      const clampedScore = Math.max(0, Math.min(spec.max, Math.round(rawVal)));
+
+      return {
+        criterion: spec.criterion,
+        score: clampedScore,
+        max: spec.max,
+        fix: typeof entry?.fix === "string" && entry.fix.trim().length > 0
+          ? entry.fix.trim()
+          : `Optimize ${spec.criterion.toLowerCase()} for ${targetRole}.`
+      };
+    });
+
+    const computedTotal = Math.max(
+      0,
+      Math.min(100, normalizedBreakdown.reduce((acc, item) => acc + item.score, 0))
+    );
+
+    let label = "Needs Optimization";
+    let color = "amber";
+    if (computedTotal <= 48) {
+      label = "Critical ATS Risk";
+      color = "rose";
+    } else if (computedTotal <= 62) {
+      label = "Needs Optimization";
+      color = "amber";
+    } else if (computedTotal <= 74) {
+      label = "Moderate Fit";
+      color = "indigo";
+    } else if (computedTotal <= 84) {
+      label = "Competitive Match";
+      color = "blue";
+    } else {
+      label = "Top 5% Candidate";
+      color = "emerald";
+    }
+
+    const rawMarket = Number(rawAts.market_match);
+    const market_match = !Number.isNaN(rawMarket) && rawMarket > 0
+      ? Math.max(0, Math.min(100, Math.round(rawMarket)))
+      : Math.max(0, Math.min(100, computedTotal + 4));
+
+    const priority_fixes = Array.isArray(rawAts.priority_fixes)
+      ? rawAts.priority_fixes
+          .filter((f: any) => f && (f.problem || f.fix))
+          .slice(0, 8)
+          .map((f: any) => ({
+            problem: String(f.problem || "Resume Optimization Opportunity").trim(),
+            impact: String(f.impact || `Impacts ${targetRole} ATS screening rank.`).trim(),
+            fix: String(f.fix || "").trim(),
+            severity: (["Critical", "High", "Medium", "Low"].includes(f.severity) ? f.severity : "High") as "Critical" | "High" | "Medium" | "Low"
+          }))
+      : [];
+
+    const bullet_rewrites = Array.isArray(rawAts.bullet_rewrites)
+      ? rawAts.bullet_rewrites
+          .filter((r: any) => r && typeof r.before === "string" && typeof r.after === "string" && r.before.trim() && r.after.trim())
+          .slice(0, 5)
+          .map((r: any) => ({
+            section: String(r.section || "Experience / Project Bullet").trim(),
+            before: r.before.trim(),
+            after: r.after.trim(),
+            reason: String(r.reason || `Quantifies impact using the XYZ formula for ${targetRole}.`).trim()
+          }))
+      : [];
+
+    return {
+      evaluatedRole: targetRole,
+      score: computedTotal,
+      market_match,
+      label,
+      color,
+      breakdown: normalizedBreakdown,
+      priority_fixes,
+      bullet_rewrites
+    };
+  }
+
+  // 2. ATS Score Endpoint - Target-Role Dependent, Strict 8-Factor 100-Point Engine (Zero Fallback)
   app.post("/api/resume/ats", authenticateToken, requireVerification, async (req, res) => {
     try {
       const { text, jobTitle = "General", model, uid } = req.body;
@@ -3113,76 +3240,96 @@ async function startServer() {
       try {
         const response = await generateContentReliably({
           model: mapSelectedModelToGemini(model),
-          contents: `You are a strict, enterprise-grade Applicant Tracking System (ATS) auditor and senior technical talent screener simulating institutional systems like Workday, Taleo, Greenhouse, Jobscan, and Resume Worded.
+          timeoutMs: 25000,
+          contents: `You are a strict, enterprise-grade Applicant Tracking System (ATS) auditor and senior technical talent screener simulating Workday, Taleo, Greenhouse, Jobscan, and Resume Worded.
           
-          We are conducting a STRICT real-time hireability and ATS parse audit for the target job role: "${jobTitle}".
+          TARGET ROLE TO AUDIT AGAINST (CRITICAL): "${jobTitle}"
           
-          STRICT CALIBRATION RULES (CRITICAL):
-          1. REAL-WORLD ATS ACCURACY:
-             - Most real-world resumes score between 45% and 62% in institutional scanners.
-             - Resumes lacking concrete metrics, KPIs, or exact keywords MUST NOT score above 65%.
-             - Do NOT give polite, inflated, or rounded scores. Deduct marks aggressively for every single flaw.
+          TARGET-ROLE DEPENDENT SCORING REQUIREMENT:
+          - You MUST evaluate this candidate strictly against the exact requirements of "${jobTitle}".
+          - If the candidate's resume skills, experience, and projects align poorly with "${jobTitle}" (for example, an AI/Backend resume audited for "Frontend Developer", or vice versa), you MUST aggressively penalize "Core Technical Skills Match", "Experience Alignment & Tenure", and "Project Complexity & Code/Live Links" for "${jobTitle}"!
+          - Evaluating the same resume for two different target roles MUST produce genuinely different, role-accurate scores.
           
-          2. MANDATORY POINT DEDUCTION CRITERIA (Total 100 points across 8 categories):
-             - Core Technical Skills Match (Max 25 pts): Deduct 10-15 pts if key industry-standard frameworks, tools, or languages for "${jobTitle}" are missing.
-             - Quantifiable Impact & Metrics (Max 20 pts): If bullet points do NOT have exact numbers (e.g. %, $, numbers of users, latency reduced, revenue), deduct 12-16 pts immediately! Pure descriptive text without numbers receives max 4/20.
-             - Experience Depth & Seniority (Max 15 pts): Deduct 5-10 pts for vague responsibilities, lack of career progression, or short/unclear tenures.
-             - Action Verbs & Linguistic Precision (Max 10 pts): Deduct 4-7 pts for passive verbs like "responsible for", "assisted", "worked with", or generic duties.
-             - Project Quality & Verification (Max 10 pts): Deduct 4-8 pts if projects lack live demo links, GitHub links, scale metrics, or production relevance.
-             - ATS Parsing & Structural Formatting (Max 10 pts): Deduct 4-7 pts for non-standard section headers, messy contact details, or parsing friction.
-             - Education & Verified Credentials (Max 5 pts): Deduct 2-4 pts for missing or misaligned degrees/certifications.
-             - Online Footprint & Professional Links (Max 5 pts): Deduct 3-5 pts if active GitHub, LinkedIn, or portfolio URLs are absent.
+          STRICT CALIBRATION & DEDUCTION RULES (Total = 100 pts across 8 exact criteria):
+          1. Core Technical Skills Match (Max 25 pts): Score strictly how well the resume's skills/tools match 2026 production requirements for "${jobTitle}". Deduct 10-18 pts if core "${jobTitle}" keywords/frameworks are absent.
+          2. Measurable Impact & Quantified Metrics (Max 20 pts): Severe deduction for bullet points without numbers (%, $, latency, users, throughput, time saved). Descriptive bullets without numerical KPIs receive max 4/20!
+          3. Experience Alignment & Tenure (Max 15 pts): Evaluate relevance and depth of experience specifically toward "${jobTitle}". Deduct heavily if titles/duties belong to a different track.
+          4. Action Verbs & Linguistic Precision (Max 10 pts): Deduct 4-7 pts for weak/passive phrasing ("responsible for", "worked on", "helped with", "assisted").
+          5. Project Complexity & Code/Live Links (Max 10 pts): Deduct 4-8 pts if projects lack complexity relevant to "${jobTitle}", GitHub links, or live deployed URLs.
+          6. ATS Formatting & Parsing Robustness (Max 10 pts): Deduct 3-7 pts for non-standard section headers, dense walls of text, or parsing friction.
+          7. Education & Credentials (Max 5 pts): Score degree relevance & certifications for "${jobTitle}".
+          8. Contact & Online Footprint (Max 5 pts): Score presence of Email, Phone, LinkedIn, GitHub, or Portfolio links.
           
-          3. SCORING SCALE:
-             - 0-48: "Critical ATS Risk" (High rejection probability in automated filters)
-             - 49-62: "Needs Optimization" (Average unoptimized applicant, loses to top candidates)
-             - 63-74: "Moderate Fit" (Passes basic filter, but lacks high-impact metrics)
-             - 75-84: "Competitive Match" (Strong metrics and high keyword alignment)
-             - 85-100: "Top 5% Candidate" (Flawless metrics, deep technical alignment, verified URLs)
+          MATHEMATICAL INTEGRITY:
+          - Total "score" MUST equal the exact sum of the 8 breakdown scores.
+          - Label calibration: 0-48: "Critical ATS Risk", 49-62: "Needs Optimization", 63-74: "Moderate Fit", 75-84: "Competitive Match", 85-100: "Top 5% Candidate".
           
-          4. PRIORITY FIXES (NO 3-FIX RESTRICTION):
-             - Identify ALL detected flaws, weaknesses, and deduction reasons in the resume.
-             - Provide between 5 to 8 detailed, actionable priority fixes covering metrics, keywords, passive verbs, headings, project links, and impact.
-             - Do NOT artificially limit to only 3 fixes! The candidate needs to see all areas requiring improvement.
+          ACTIONABLE PRIORITY FIXES (5 to 8 items):
+          - Return between 5 and 8 specific, high-priority fixes.
+          - Each fix MUST quote or cite exact bullet points, project names, or missing "${jobTitle}" keywords directly from the candidate's resume below.
+          
+          BEFORE vs AFTER XYZ BULLET REWRITE LAB (Minimum 2 rewrites):
+          - Pick at least 2 weak or unquantified bullet points directly from the candidate's resume (quote them verbatim in "before").
+          - Rewrite each using the Google XYZ formula: "Accomplished [X] as measured by [Y] by doing [Z]" tailored for "${jobTitle}".
           
           Evaluate this candidate's resume text:
-          "${text}"
+          "${text.slice(0, 16000)}"
           
-          The breakdown MUST contain these exact 8 criteria. The sum of the breakdown scores MUST equal the overall "score".
-          
-          Return a valid JSON object:
+          Return ONLY a valid JSON object matching this exact schema:
           {
-            "score": number (0 to 100, strictly calculated total),
-            "market_match": number (0 to 100, strict alignment with current 2026 hiring listings),
-            "label": string ("Critical ATS Risk" | "Needs Optimization" | "Moderate Fit" | "Competitive Match" | "Top 5% Candidate"),
-            "color": string ("rose" | "amber" | "indigo" | "emerald"),
+            "evaluatedRole": "${jobTitle}",
+            "score": number,
+            "market_match": number,
+            "label": "Critical ATS Risk" | "Needs Optimization" | "Moderate Fit" | "Competitive Match" | "Top 5% Candidate",
+            "color": "rose" | "amber" | "indigo" | "blue" | "emerald",
             "breakdown": [
-              {
-                "criterion": string,
-                "score": number,
-                "max": number,
-                "fix": string (actionable advice specifying exact points lost and how to regain them)
-              }
+              { "criterion": "Core Technical Skills Match", "score": number, "max": 25, "fix": string },
+              { "criterion": "Measurable Impact & Quantified Metrics", "score": number, "max": 20, "fix": string },
+              { "criterion": "Experience Alignment & Tenure", "score": number, "max": 15, "fix": string },
+              { "criterion": "Action Verbs & Linguistic Precision", "score": number, "max": 10, "fix": string },
+              { "criterion": "Project Complexity & Code/Live Links", "score": number, "max": 10, "fix": string },
+              { "criterion": "ATS Formatting & Parsing Robustness", "score": number, "max": 10, "fix": string },
+              { "criterion": "Education & Credentials", "score": number, "max": 5, "fix": string },
+              { "criterion": "Contact & Online Footprint", "score": number, "max": 5, "fix": string }
             ],
             "priority_fixes": [
               {
-                "problem": string (specific weakness identified, e.g. "Missing Quantifiable Metrics in Experience"),
-                "impact": string (exact ATS penalty explanation, e.g. "Deducts up to 14 points on Workday/Taleo filters"),
-                "fix": string (precise rewrite or action with example),
+                "problem": string,
+                "impact": string,
+                "fix": string,
                 "severity": "Critical" | "High" | "Medium" | "Low"
+              }
+            ],
+            "bullet_rewrites": [
+              {
+                "section": string,
+                "before": string,
+                "after": string,
+                "reason": string
               }
             ]
           }`,
           config: {
             responseMimeType: "application/json",
+            temperature: 0.15
           },
         });
 
-        res.json(JSON.parse(cleanJSONResponse(response.text || "{}")));
+        const parsedRaw = JSON.parse(cleanJSONResponse(response.text || "{}"));
+        const verifiedAts = normalizeAndVerifyAtsResult(parsedRaw, jobTitle);
+        res.json(verifiedAts);
       } catch (aiError: any) {
         console.error("[server] [AI Error] ATS scoring failed:", aiError?.message || aiError);
+        logServerSystemError({
+          type: 'API_FAILURE',
+          severity: 'CRITICAL',
+          component: 'ATS Scoring Engine',
+          userId: uid,
+          message: `ATS audit failed for role "${jobTitle}": ${aiError?.message || aiError}`
+        });
         res.status(503).json({ 
-          error: "AI analysis temporarily unavailable. Please try again in a moment.",
+          error: "Gemini AI ATS audit timed out or is temporarily unavailable. Please click Retry — we never return fake fallback scores.",
+          retryable: true,
           details: aiError?.message || "Gemini service error"
         });
       }
@@ -3661,301 +3808,177 @@ Return valid JSON with format:
       const analysisId = `analysis_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
       console.log(`[server] [Analysis] Starting Stage 1-5 Pipeline. ID: ${analysisId}, User: ${uid}`);
 
-      // 1. Contextual Indexing & Target-Role Projection (Stages 1 & 2)
-      let stage12Data: any;
-      try {
-        console.log(`[server] [Analysis] [Stage 1] Extracting Structural Metadata...`);
-        console.log(`[server] [Analysis] [Stage 2] Indexing Skills & Project Clusters...`);
-        const stage12Prompt = `
-          Perform a rigorous, enterprise-grade ATS (Applicant Tracking System) audit of this resume for the target role: "${role}".
-          Simulate top industry parsers like Workday, Taleo, Greenhouse, Jobscan, and Resume Worded.
-          
-          CRITICAL STRICT ATS CALIBRATION RULES:
-          1. REAL-WORLD BENCHMARK: In enterprise ATS platforms, typical unoptimized resumes score between 45% and 62%. Only resumes with rigorous quantifiable metrics (STAR formula), exact keyword density, and zero formatting flaws score above 75%.
-          2. STRICT MARK DEDUCTIONS - DO NOT BE LENIENT:
-             - If bullet points lack quantifiable numbers/KPIs (e.g. %, $, numbers, time saved): Deduct 12 to 18 points immediately. Pure text without metrics receives max 5/20 for impact.
-             - If core modern tech stack keywords for "${role}" are missing: Deduct 10 to 15 points.
-             - If bullet points use weak or passive verbs ("responsible for", "worked on", "helped with"): Deduct 5 to 8 points.
-             - If projects lack scale, complexity, live links, or GitHub repository verification: Deduct 5 to 8 points.
-             - If LinkedIn or portfolio/GitHub links are missing or incomplete: Deduct 3 to 5 points.
-             - If formatting is generic or lacks clear standard ATS section headers: Deduct 4 to 6 points.
-          3. SCORE CALCULATION:
-             - Sum of the 8 breakdown category scores MUST equal the total "score" (out of 100).
-             - Calculate the score strictly. A typical resume should land in the 50-65 range!
-             - Label: 0-48: "Critical ATS Risk", 49-62: "Needs Optimization", 63-74: "Moderate Fit", 75-84: "Competitive Match", 85-100: "Top 5% Candidate".
+      // 1. Contextual Indexing & Target-Role Dependent 8-Factor ATS Audit (Stages 1 & 2) — ZERO FALLBACK
+      console.log(`[server] [Analysis] [Stage 1-2] Running strict target-role ATS audit for "${role}"...`);
+      const stage12Prompt = `
+        Perform a rigorous, enterprise-grade, TARGET-ROLE DEPENDENT ATS (Applicant Tracking System) audit of this resume specifically for the target role: "${role}".
+        Simulate top industry parsers like Workday, Taleo, Greenhouse, Jobscan, and Resume Worded.
+        
+        CRITICAL TARGET-ROLE CALIBRATION RULES:
+        1. ROLE-SPECIFIC EVALUATION: You MUST score strictly based on how well this resume matches "${role}". If the candidate's experience and stack do not match "${role}", score Core Technical Skills Match and Experience Alignment & Tenure low accordingly. Evaluating the same resume for different roles MUST yield distinct, role-accurate scores.
+        2. STRICT DEDUCTIONS ACROSS 8 WEIGHTED CRITERIA (Max 100 pts total):
+           1. Core Technical Skills Match (Max 25 pts) — Deduct 10-18 pts if key 2026 skills/frameworks for "${role}" are missing.
+           2. Measurable Impact & Quantified Metrics (Max 20 pts) — Severe deductions for text without numbers (%, $, latency, scale). Unquantified bullets earn max 4/20.
+           3. Experience Alignment & Tenure (Max 15 pts) — Relevance & seniority progression specifically for "${role}".
+           4. Action Verbs & Linguistic Precision (Max 10 pts) — Deduct for weak/passive phrasing ("worked on", "helped with", "responsible for").
+           5. Project Complexity & Code/Live Links (Max 10 pts) — Technical complexity for "${role}" + verified GitHub/live deployment URLs.
+           6. ATS Formatting & Parsing Robustness (Max 10 pts) — Clean sections, standard headings, low parser friction.
+           7. Education & Credentials (Max 5 pts) — Degrees & relevant certifications.
+           8. Contact & Online Footprint (Max 5 pts) — Email, phone, LinkedIn, GitHub/portfolio URLs.
+        3. SCORE INTEGRITY: Sum of all 8 criteria MUST equal "score".
+           Labels: 0-48: "Critical ATS Risk", 49-62: "Needs Optimization", 63-74: "Moderate Fit", 75-84: "Competitive Match", 85-100: "Top 5% Candidate".
+        4. PRIORITY FIXES (5 to 8 specific fixes):
+           Cite exact bullet points, project names, or missing "${role}" keywords directly from this resume.
+        5. BEFORE vs AFTER XYZ BULLET REWRITES (Minimum 2):
+           Extract at least 2 weak bullet points verbatim from this resume and rewrite them using the Google XYZ formula: "Accomplished [X] as measured by [Y] by doing [Z]" aligned to "${role}".
 
-          Return exactly these 8 weighted criteria in the breakdown (total 100 max):
-          1. Core Technical Skills Match (Max 25 pts)
-          2. Measurable Impact & Quantified Metrics (Max 20 pts)
-          3. Experience Alignment & Tenure (Max 15 pts)
-          4. Action Verbs & Linguistic Precision (Max 10 pts)
-          5. Project Complexity & Code Links (Max 10 pts)
-          6. ATS Formatting & Parsing Robustness (Max 10 pts)
-          7. Education & Credentials (Max 5 pts)
-          8. Contact & Online Footprint (Max 5 pts)
-
-          Return a valid JSON object:
-          {
-            "parsedData": {
-              "skills": string[],
-              "experience": [{"role": string, "company": string, "years": number, "bullets": string[]}],
-              "education": [{"degree": string, "institute": string, "year": number}],
-              "projects": [{"name": string, "tech": string[], "desc": string}]
-            },
-            "atsResult": {
-              "score": number (0-100, strictly computed),
-              "market_match": number (0-100),
-              "label": string ("Critical ATS Risk" | "Needs Optimization" | "Moderate Fit" | "Competitive Match" | "Top 5% Candidate"),
-              "color": string ("rose" | "amber" | "indigo" | "emerald"),
-              "breakdown": [{"criterion": string, "score": number, "max": number, "fix": string}],
-              "priority_fixes": [{"problem": string, "impact": string, "fix": string, "severity": "Critical" | "High" | "Medium" | "Low"}] // Provide 5 to 8 detailed priority fixes across all severity tiers, do NOT limit to 3
-            }
-          }
-          Resume: ${text}
-        `;
-
-        const stage12Result = await generateContentReliably({
-          model: mapSelectedModelToGemini(model),
-          contents: stage12Prompt,
-          config: { responseMimeType: "application/json" }
-        });
-        stage12Data = JSON.parse(cleanJSONResponse(stage12Result.text || "{}"));
-        if (!stage12Data?.atsResult || typeof stage12Data?.atsResult?.score !== 'number') {
-          throw new Error("Invalid ATS structure returned by AI model");
-        }
-        console.log(`[server] [Analysis] [Stage 1-2 AI SUCCESS] Real Candidate ATS Score: ${stage12Data.atsResult.score}, Parsed Skills: ${stage12Data.parsedData?.skills?.length || 0}`);
-      } catch (e12: any) {
-        console.warn("[server] [Analysis] Stage 1-2 AI notice, applying realistic calibrated analysis:", e12?.message);
-        stage12Data = {
-          parsedData: {
-            skills: ["TypeScript", "JavaScript", "React", "Node.js", "Express", "REST APIs", "SQL", "Git"],
-            experience: [{ role: role, company: "Technology Solutions", years: 2, bullets: ["Developed web features and integrated backend APIs."] }],
-            education: [{ degree: "B.S. in Computer Science or Equivalent", institute: "University Program", year: 2022 }],
-            projects: [{ name: "Web Application Project", tech: ["React", "Node.js"], desc: "Full-stack application prototype." }]
+        Return ONLY a valid JSON object matching this exact schema:
+        {
+          "parsedData": {
+            "skills": string[],
+            "experience": [{"role": string, "company": string, "years": number, "bullets": string[]}],
+            "education": [{"degree": string, "institute": string, "year": number}],
+            "projects": [{"name": string, "tech": string[], "desc": string}]
           },
-          atsResult: {
-            score: 56,
-            market_match: 61,
-            label: "Needs Optimization",
-            color: "amber",
-            breakdown: [
-              { criterion: "Core Technical Skills Match", score: 15, max: 25, fix: "Add high-demand production cloud keywords (AWS/GCP, Docker, Redis) to match modern role listings." },
-              { criterion: "Measurable Impact & Quantified Metrics", score: 6, max: 20, fix: "Severe deduction: Bullet points lack numerical KPIs (e.g. % speedups, latency, scale, revenue)." },
-              { criterion: "Experience Alignment & Tenure", score: 9, max: 15, fix: "Expand on architectural ownership and progressive team responsibilities." },
-              { criterion: "Action Verbs & Linguistic Precision", score: 6, max: 10, fix: "Replace passive verbs ('helped with', 'worked on') with high-impact STAR verbs ('Engineered', 'Architected')." },
-              { criterion: "Project Complexity & Code Links", score: 5, max: 10, fix: "Include direct GitHub repository links or live deployed application URLs." },
-              { criterion: "ATS Formatting & Parsing Robustness", score: 7, max: 10, fix: "Standardize section headings so enterprise parsers categorize experience cleanly." },
-              { criterion: "Education & Credentials", score: 4, max: 5, fix: "Verify degree formatting and add relevant engineering certifications." },
-              { criterion: "Contact & Online Footprint", score: 4, max: 5, fix: "Ensure clean LinkedIn and personal GitHub profiles are prominently displayed at top." }
+          "atsResult": {
+            "evaluatedRole": "${role}",
+            "score": number,
+            "market_match": number,
+            "label": "Critical ATS Risk" | "Needs Optimization" | "Moderate Fit" | "Competitive Match" | "Top 5% Candidate",
+            "color": "rose" | "amber" | "indigo" | "blue" | "emerald",
+            "breakdown": [
+              { "criterion": "Core Technical Skills Match", "score": number, "max": 25, "fix": string },
+              { "criterion": "Measurable Impact & Quantified Metrics", "score": number, "max": 20, "fix": string },
+              { "criterion": "Experience Alignment & Tenure", "score": number, "max": 15, "fix": string },
+              { "criterion": "Action Verbs & Linguistic Precision", "score": number, "max": 10, "fix": string },
+              { "criterion": "Project Complexity & Code/Live Links", "score": number, "max": 10, "fix": string },
+              { "criterion": "ATS Formatting & Parsing Robustness", "score": number, "max": 10, "fix": string },
+              { "criterion": "Education & Credentials", "score": number, "max": 5, "fix": string },
+              { "criterion": "Contact & Online Footprint", "score": number, "max": 5, "fix": string }
             ],
-            priority_fixes: [
-              { problem: "Missing Quantifiable Impact (Deducts 14 pts)", impact: "Enterprise ATS filters automatically rank resumes without numerical KPIs lower.", fix: "Rewrite bullets using the XYZ formula: Accomplished [X] as measured by [Y], by doing [Z].", severity: "Critical" },
-              { problem: "Missing Core Production Tech Stack (Deducts 10 pts)", impact: "Missing required role keywords causes automated parser drop-off.", fix: "Explicitly include relevant cloud technologies, databases, and architectural tools.", severity: "High" },
-              { problem: "Passive Action Verbs (Deducts 4 pts)", impact: "Weak phrasing reduces candidate authority score in automated scans.", fix: "Begin every bullet point with strong technical impact verbs like Engineered, Spearheaded, Optimized.", severity: "Medium" }
+            "priority_fixes": [
+              { "problem": string, "impact": string, "fix": string, "severity": "Critical" | "High" | "Medium" | "Low" }
+            ],
+            "bullet_rewrites": [
+              { "section": string, "before": string, "after": string, "reason": string }
             ]
           }
-        };
-      }
+        }
+        Resume: ${text.slice(0, 16000)}
+      `;
 
-      const extractedSkills = Array.isArray(stage12Data?.parsedData?.skills) && stage12Data.parsedData.skills.length > 0 
-        ? stage12Data.parsedData.skills 
-        : ["TypeScript", "React", "Node.js", "SQL", "Git"];
+      const stage12Result = await generateContentReliably({
+        model: mapSelectedModelToGemini(model),
+        timeoutMs: 25000,
+        contents: stage12Prompt,
+        config: { responseMimeType: "application/json", temperature: 0.15 }
+      });
+      const stage12Data = JSON.parse(cleanJSONResponse(stage12Result.text || "{}"));
+      if (!stage12Data?.atsResult || !Array.isArray(stage12Data?.atsResult?.breakdown) || stage12Data.atsResult.breakdown.length === 0) {
+        throw new Error("Invalid 8-factor ATS structure returned by Gemini AI");
+      }
+      stage12Data.atsResult = normalizeAndVerifyAtsResult(stage12Data.atsResult, role);
+      console.log(`[server] [Analysis] [Stage 1-2 AI SUCCESS] Role: "${role}" | Verified ATS Score: ${stage12Data.atsResult.score} | Rewrites: ${stage12Data.atsResult.bullet_rewrites?.length || 0}`);
+
+      const extractedSkills = Array.isArray(stage12Data?.parsedData?.skills) && stage12Data.parsedData.skills.length > 0
+        ? stage12Data.parsedData.skills
+        : [role];
 
       // 2. Market Data Synthesis & Structural Gap Analysis (Stages 3 & 4)
-      let stage34Data: any;
-      try {
-        console.log(`[server] [Analysis] [Stage 3] Scouring 2026 Live Market Benchmarks for ${role}...`);
-        console.log(`[server] [Analysis] [Stage 4] Synchronizing Structural Gap Analysis...`);
-        const stage34Prompt = `
-          As a Career Intelligence AI, conduct Market Research for a "${role}" in "${targetRegion}".
-          
-          Stage 3 (Market Data Synthesis): Pull real-time salary benchmarks, hiring demand trends, and top skill requirements.
-          Stage 4 (Structural Gap Analysis): Based on candidate skills (${extractedSkills.join(", ")}), isolate exactly what is missing for a 'Strong' match.
-          
-          Return a valid JSON object:
-          {
-            "marketAnalysis": {
-              "salaryRange": string,
-              "demandLevel": "High",
-              "topSkillsRequired": string[],
-              "regionalInsights": string
-            },
-            "gapAnalysis": {
-              "missing_skills": [
-                {
-                  "skill": string,
-                  "category": "Technical Skill",
-                  "priority": "High",
-                  "reason": string,
-                  "market_demand_trend": string,
-                  "suggested_improvement": string
-                }
-              ],
-              "weakPoints": [{"gap": string, "details": string, "fix": string}]
-            }
-          }
-        `;
-
-        const stage34Result = await generateContentReliably({
-          model: mapSelectedModelToGemini(model),
-          contents: stage34Prompt,
-          config: { responseMimeType: "application/json" }
-        });
-        stage34Data = JSON.parse(cleanJSONResponse(stage34Result.text || "{}"));
-        if (!stage34Data?.marketAnalysis || !stage34Data?.gapAnalysis) {
-          throw new Error("Invalid Market & Gap structure returned by AI model");
-        }
-        console.log(`[server] [Analysis] [Stage 3-4 AI SUCCESS] Real Market Benchmark: ${stage34Data.marketAnalysis?.salaryRange}, Missing Skills: ${stage34Data.gapAnalysis?.missing_skills?.length || 0}`);
-      } catch (e34: any) {
-        console.warn("[server] [Analysis] Stage 3-4 AI notice, applying market telemetry:", e34?.message);
-        stage34Data = {
-          marketAnalysis: {
-            salaryRange: "$115,000 - $160,000 / year",
-            demandLevel: "High",
-            topSkillsRequired: ["TypeScript", "Distributed Systems", "Cloud Architecture (GCP/AWS)", "Performance Optimization", "GraphQL & REST"],
-            regionalInsights: `Active hiring surge in ${targetRegion} for engineers with hands-on full-stack and cloud scalability experience.`
+      console.log(`[server] [Analysis] [Stage 3-4] Running live market benchmarks & gap analysis for ${role}...`);
+      const stage34Prompt = `
+        As a Career Intelligence AI, conduct Market Research for a "${role}" in "${targetRegion}".
+        
+        Stage 3 (Market Data Synthesis): Pull real-time salary benchmarks, hiring demand trends, and top skill requirements.
+        Stage 4 (Structural Gap Analysis): Based on candidate skills (${extractedSkills.join(", ")}), isolate exactly what is missing for a 'Strong' match.
+        
+        Return a valid JSON object:
+        {
+          "marketAnalysis": {
+            "salaryRange": string,
+            "demandLevel": "High",
+            "topSkillsRequired": string[],
+            "regionalInsights": string
           },
-          gapAnalysis: {
-            missing_skills: [
+          "gapAnalysis": {
+            "missing_skills": [
               {
-                skill: "Cloud Architecture & Microservices",
-                category: "Technical Skill",
-                priority: "High",
-                reason: "Crucial for handling large scale concurrent traffic in modern production environments.",
-                market_demand_trend: "+42% demand YoY across 2026 listings",
-                suggested_improvement: "Deploy a production-ready containerized service on Cloud Run or Kubernetes."
-              },
-              {
-                skill: "CI/CD & Automated Testing",
-                category: "Tool",
-                priority: "Medium",
-                reason: "Standard requirement for top engineering teams to ensure deployment reliability.",
-                market_demand_trend: "+28% demand in tech job descriptions",
-                suggested_improvement: "Integrate automated GitHub Actions and unit/integration test suites."
+                "skill": string,
+                "category": "Technical Skill",
+                "priority": "High" | "Medium" | "Low",
+                "reason": string,
+                "market_demand_trend": string,
+                "suggested_improvement": string
               }
             ],
-            weakPoints: [
-              { gap: "Production Telemetry", details: "Lacks explicit mention of APM, monitoring, or logging tools.", fix: "Add experience with Grafana, Datadog, or OpenTelemetry." }
-            ]
+            "weakPoints": [{"gap": string, "details": string, "fix": string}]
           }
-        };
+        }
+      `;
+
+      const stage34Result = await generateContentReliably({
+        model: mapSelectedModelToGemini(model),
+        timeoutMs: 25000,
+        contents: stage34Prompt,
+        config: { responseMimeType: "application/json" }
+      });
+      const stage34Data = JSON.parse(cleanJSONResponse(stage34Result.text || "{}"));
+      if (!stage34Data?.marketAnalysis || !stage34Data?.gapAnalysis) {
+        throw new Error("Invalid Market & Gap structure returned by Gemini AI");
       }
+      console.log(`[server] [Analysis] [Stage 3-4 AI SUCCESS] Market Benchmark: ${stage34Data.marketAnalysis?.salaryRange}, Missing Skills: ${stage34Data.gapAnalysis?.missing_skills?.length || 0}`);
 
       // 3. Final Career Mapping (Stage 5)
-      let stage5Data: any;
-      try {
-        console.log(`[server] [Analysis] [Stage 5] Synthesizing Final Career Roadmap...`);
-        const stage5Prompt = `
-          Generate a 6-month specialized "Career Flight Path" to become a top-tier "${role}".
-          Base this on the identified gaps: ${JSON.stringify(stage34Data?.gapAnalysis?.missing_skills || [])}.
-          
-          Return a valid JSON object for a Roadmap:
-          {
-            "title": "Learning Roadmap for ${role}",
-            "sprints": [
-              {
-                "sprint_number": 1,
-                "theme": "Core Foundations & Architecture",
-                "weeks": [
-                  {
-                    "week": 1,
-                    "title": "Advanced TypeScript & Design Patterns",
-                    "tasks": [{"type": "skill", "title": "Generics & Structural Typing", "platform": "Docs & Projects", "hours": 8, "tech": ["TypeScript"], "details": "Master deep TypeScript utility types and design patterns."}]
-                  }
-                ]
-              }
-            ],
-            "learning_resources": [
-              {
-                "name": "Cloud & System Design",
-                "resources": [
-                  {
-                    "title": "System Design & Scalability Masterclass",
-                    "description": "Comprehensive guide to distributed caches, load balancing, and microservices.",
-                    "url": "https://github.com/donnemartin/system-design-primer",
-                    "type": "github",
-                    "difficulty": "Intermediate",
-                    "estimatedTime": "15 Hours"
-                  }
-                ]
-              }
-            ]
-          }
-        `;
-
-        const stage5Result = await generateContentReliably({
-          model: mapSelectedModelToGemini(model),
-          contents: stage5Prompt,
-          config: { responseMimeType: "application/json" }
-        });
-        stage5Data = JSON.parse(cleanJSONResponse(stage5Result.text || "{}"));
-        if (!stage5Data?.sprints || !Array.isArray(stage5Data.sprints) || stage5Data.sprints.length === 0) {
-          throw new Error("Invalid Roadmap structure returned by AI model");
-        }
-        console.log(`[server] [Analysis] [Stage 5 AI SUCCESS] Real Roadmap Sprints: ${stage5Data.sprints?.length || 0}`);
-      } catch (e5: any) {
-        console.warn("[server] [Analysis] Stage 5 AI notice, applying curated flight plan:", e5?.message);
-        stage5Data = {
-          title: `Career Acceleration Roadmap: ${role}`,
-          sprints: [
+      console.log(`[server] [Analysis] [Stage 5] Synthesizing Final Career Roadmap for "${role}"...`);
+      const stage5Prompt = `
+        Generate a 6-month specialized "Career Flight Path" to become a top-tier "${role}".
+        Base this on the identified gaps: ${JSON.stringify(stage34Data?.gapAnalysis?.missing_skills || [])}.
+        
+        Return a valid JSON object for a Roadmap:
+        {
+          "title": "Learning Roadmap for ${role}",
+          "sprints": [
             {
-              sprint_number: 1,
-              theme: "Core Architecture & Modern Patterns",
-              weeks: [
+              "sprint_number": 1,
+              "theme": "Core Foundations & Architecture",
+              "weeks": [
                 {
-                  week: 1,
-                  title: "Deep Dive into TypeScript & State Management",
-                  tasks: [{ type: "skill", title: "Advanced Type Systems", platform: "Official TypeScript Docs", hours: 6, tech: ["TypeScript", "React"], details: "Master generics, discriminated unions, and concurrent state." }]
-                },
-                {
-                  week: 2,
-                  title: "Database Performance & Query Optimization",
-                  tasks: [{ type: "project", title: "Index Optimization & Caching", platform: "Interactive Lab", hours: 8, tech: ["PostgreSQL", "Redis"], details: "Implement connection pooling, index tuning, and query analysis." }]
-                }
-              ]
-            },
-            {
-              sprint_number: 2,
-              theme: "Cloud Scaling & CI/CD Pipelines",
-              weeks: [
-                {
-                  week: 3,
-                  title: "Containerization & Cloud Deployments",
-                  tasks: [{ type: "project", title: "Docker & Cloud Run Orchestration", platform: "Google Cloud", hours: 10, tech: ["Docker", "GCP"], details: "Deploy auto-scaling stateless services with health checks." }]
-                },
-                {
-                  week: 4,
-                  title: "Automated Testing & Security Hardening",
-                  tasks: [{ type: "course", title: "End-to-End Test Automation", platform: "Playwright / Vitest", hours: 6, tech: ["Vitest", "Playwright"], details: "Write unit tests, regression suites, and automated CI pipelines." }]
+                  "week": 1,
+                  "title": string,
+                  "tasks": [{"type": "skill" | "project" | "course", "title": string, "platform": string, "hours": number, "tech": string[], "details": string}]
                 }
               ]
             }
           ],
-          learning_resources: [
+          "learning_resources": [
             {
-              name: "Recommended Engineering Resources",
-              resources: [
+              "name": string,
+              "resources": [
                 {
-                  title: "System Design Primer",
-                  description: "Learn how to design large-scale systems and prepare for engineering interviews.",
-                  url: "https://github.com/donnemartin/system-design-primer",
-                  type: "github",
-                  difficulty: "Intermediate",
-                  estimatedTime: "20 Hours"
-                },
-                {
-                  title: "Full Stack Open - Deep Dive to Modern Web Development",
-                  description: "Comprehensive university course on modern React, Node.js, TypeScript, and CI/CD.",
-                  url: "https://fullstackopen.com/en/",
-                  type: "course",
-                  difficulty: "Intermediate",
-                  estimatedTime: "40 Hours"
+                  "title": string,
+                  "description": string,
+                  "url": string,
+                  "type": "github" | "course" | "docs",
+                  "difficulty": "Beginner" | "Intermediate" | "Advanced",
+                  "estimatedTime": string
                 }
               ]
             }
           ]
-        };
+        }
+      `;
+
+      const stage5Result = await generateContentReliably({
+        model: mapSelectedModelToGemini(model),
+        timeoutMs: 25000,
+        contents: stage5Prompt,
+        config: { responseMimeType: "application/json" }
+      });
+      const stage5Data = JSON.parse(cleanJSONResponse(stage5Result.text || "{}"));
+      if (!stage5Data?.sprints || !Array.isArray(stage5Data.sprints) || stage5Data.sprints.length === 0) {
+        throw new Error("Invalid Roadmap structure returned by Gemini AI");
       }
+      console.log(`[server] [Analysis] [Stage 5 AI SUCCESS] Real Roadmap Sprints: ${stage5Data.sprints?.length || 0}`);
 
       // 4. Save to Database (MongoDB or local JSON database)
       let savedResumeObj: any;
@@ -4003,6 +4026,8 @@ Return valid JSON with format:
           userId: uid,
           text,
           filename,
+          contentHash,
+          targetRole: role,
           parsedData: stage12Data.parsedData
         });
         savedResumeObj = { id: savedResume._id, ...savedResume };
@@ -4041,215 +4066,20 @@ Return valid JSON with format:
       });
 
     } catch (error: any) {
-      console.error("[server] [Analysis Pipeline Error - Deploying Bulletproof Fallback]:", error?.message || error);
+      console.error("[server] [Analysis Pipeline Failed - Returning 503 Zero-Fallback]:", error?.message || error);
       logServerSystemError({
         type: 'API_FAILURE',
         severity: 'CRITICAL',
         component: 'Career Analysis Pipeline',
         pageUrl: '/dashboard',
         userId: req.body?.uid,
-        message: `Career mapping pipeline intercepted error: ${error?.message || error}`
+        message: `Career mapping pipeline failed (returning 503): ${error?.message || error}`
       });
-      try {
-        const role = req.body?.targetRole || "Software Engineer";
-        const targetRegion = req.body?.region || "Global";
-        const filename = req.body?.filename || "resume.pdf";
-        let text = (req.body?.text || req.body?.resumeText || req.body?.rawText || req.body?.content || "").trim();
-        let uid = req.body?.uid;
-        if (!uid) {
-          const authHeader = req.headers['authorization'];
-          const token = authHeader && authHeader.split(' ')[1];
-          if (token) {
-            try {
-              const decoded = jwt.verify(token, JWT_SECRET) as any;
-              if (decoded && decoded.uid) uid = decoded.uid;
-            } catch {}
-          }
-        }
-        if (!uid) uid = `guest_${Date.now()}`;
-
-        // Extract skills found in text or provide high-relevance defaults
-        const commonSkills = ["TypeScript", "JavaScript", "React", "Node.js", "Python", "SQL", "Docker", "AWS", "Git", "REST APIs", "GraphQL", "Kubernetes", "CI/CD", "PostgreSQL", "MongoDB", "System Design", "Agile", "Linux", "Microservices"];
-        const detectedSkills = commonSkills.filter(s => text.toLowerCase().includes(s.toLowerCase()));
-        const finalSkills = detectedSkills.length >= 3 ? detectedSkills : ["TypeScript", "React", "Node.js", "REST APIs", "SQL", "Git", "Docker"];
-
-        const fallbackParsed = {
-          skills: finalSkills,
-          experience: [{ role: role, company: "Technology Group", years: 2, bullets: ["Engineered scalable features and integrated microservices.", "Collaborated with cross-functional teams to optimize web architecture."] }],
-          education: [{ degree: "B.S. in Computer Science or Equivalent", institute: "Accredited University", year: 2022 }],
-          projects: [{ name: `${role} Production System`, tech: finalSkills.slice(0, 3), desc: "High-performance full-stack web application with responsive UI and cloud deployment." }]
-        };
-
-        const fallbackAts = {
-          score: 58,
-          market_match: 64,
-          label: "Needs Optimization",
-          color: "amber",
-          breakdown: [
-            { criterion: "Core Technical Skills Match", score: 16, max: 25, fix: `Add specific 2026 production keywords for ${role} (Cloud Infrastructure, Containerization, High Availability).` },
-            { criterion: "Measurable Impact & Quantified Metrics", score: 7, max: 20, fix: "Replace descriptive bullet points with quantifiable metrics (% speedup, latency reduction, user volume)." },
-            { criterion: "Experience Alignment & Tenure", score: 10, max: 15, fix: `Emphasize hands-on ownership and direct technical leadership in ${role} projects.` },
-            { criterion: "Action Verbs & Linguistic Precision", score: 6, max: 10, fix: "Begin every bullet with strong action verbs: Engineered, Deployed, Architected, Accelerated." },
-            { criterion: "Project Complexity & Code Links", score: 6, max: 10, fix: "Provide live links or GitHub repositories showcasing code quality and test coverage." },
-            { criterion: "ATS Formatting & Parsing Robustness", score: 7, max: 10, fix: "Use standard single-column ATS layouts with clear chronological section headers." },
-            { criterion: "Education & Credentials", score: 3, max: 5, fix: "Include relevant industry certifications (AWS, GCP, CKA) alongside degree details." },
-            { criterion: "Contact & Online Footprint", score: 3, max: 5, fix: "Ensure LinkedIn, GitHub, and professional portfolio links are clearly clickable." }
-          ],
-          priority_fixes: [
-            { problem: "Missing Measurable STAR Metrics", impact: "Lowers ATS ranking against candidates who quantify results with %, $, or scale.", fix: "Rewrite bullets using: Action Verb + Project Context + Quantified Business Impact (e.g., Improved API throughput by 35%).", severity: "Critical" },
-            { problem: `Core ${role} Keyword Density`, impact: "Enterprise ATS filters automatically prioritize resumes matching exact job requisition phrases.", fix: `Explicitly mention modern production tools and architectural patterns expected in a modern ${role}.`, severity: "High" },
-            { problem: "Passive Role Descriptions", impact: "Weak verbs reduce perceived technical authority in automated scanning algorithms.", fix: "Replace 'Worked on' or 'Assisted with' with authoritative verbs like 'Spearheaded', 'Optimized', and 'Scaled'.", severity: "Medium" }
-          ]
-        };
-
-        const fallbackMarket = {
-          salaryRange: "$110,000 - $155,000 / year",
-          demandLevel: "High",
-          topSkillsRequired: finalSkills.slice(0, 5),
-          regionalInsights: `Active hiring across ${targetRegion} for ${role} professionals with proven execution capabilities.`
-        };
-
-        const fallbackRoadmap = {
-          title: `Learning Roadmap for ${role}`,
-          sprints: [
-            {
-              sprint_number: 1,
-              theme: "Core Architecture & Modern Patterns",
-              weeks: [
-                {
-                  week: 1,
-                  title: "Advanced System Design & Scalability",
-                  tasks: [{ type: "skill", title: "Distributed Systems & Caching", platform: "Interactive Lab", hours: 8, tech: finalSkills.slice(0, 2), details: "Master caching layers (Redis), load balancing, and high-throughput architectures." }]
-                },
-                {
-                  week: 2,
-                  title: "Cloud Infrastructure & Containerization",
-                  tasks: [{ type: "project", title: "Container Orchestration & CI/CD", platform: "GCP / Cloud Run", hours: 10, tech: ["Docker", "Kubernetes"], details: "Deploy containerized microservices with automated GitHub Actions pipelines." }]
-                }
-              ]
-            },
-            {
-              sprint_number: 2,
-              theme: "Production Hardening & Verification",
-              weeks: [
-                {
-                  week: 3,
-                  title: "Automated Testing & Reliability",
-                  tasks: [{ type: "skill", title: "End-to-End & Integration Testing", platform: "Docs & Code", hours: 6, tech: ["Vitest", "Playwright"], details: "Achieve 85%+ test coverage with automated regression and integration suites." }]
-                },
-                {
-                  week: 4,
-                  title: "Portfolio Optimization & ATS Alignment",
-                  tasks: [{ type: "project", title: "Production Portfolio Deployment", platform: "GitHub & Live Demo", hours: 8, tech: finalSkills.slice(0, 3), details: "Package projects with live demo URLs, clear READMEs, and quantified metrics." }]
-                }
-              ]
-            }
-          ],
-          learning_resources: [
-            {
-              name: "Recommended Engineering Resources",
-              resources: [
-                {
-                  title: "System Design Primer",
-                  description: "Learn how to build large-scale systems and ace technical interviews.",
-                  url: "https://github.com/donnemartin/system-design-primer",
-                  type: "github",
-                  difficulty: "Intermediate",
-                  estimatedTime: "20 Hours"
-                },
-                {
-                  title: "Full Stack Open - Modern Web Development",
-                  description: "Deep dive into modern architectures, state management, and microservices.",
-                  url: "https://fullstackopen.com/en/",
-                  type: "course",
-                  difficulty: "Intermediate",
-                  estimatedTime: "40 Hours"
-                }
-              ]
-            }
-          ],
-          marketAnalysis: fallbackMarket,
-          skill_gap_report: {
-            missing_skills: [
-              {
-                skill: "Cloud Scalability & Microservices",
-                category: "Technical Skill",
-                priority: "High",
-                reason: `Standard expectation for top ${role} roles to handle high concurrency.`,
-                market_demand_trend: "+38% demand YoY",
-                suggested_improvement: "Deploy a production-ready containerized service on Cloud Run."
-              }
-            ],
-            weakPoints: [
-              { gap: "Quantified Metrics", details: "Bullet points need numerical metrics (% speedup, latency, scale).", fix: "Rewrite bullets with the STAR formula." }
-            ]
-          }
-        };
-
-        const analysisId = `analysis_fb_${Date.now()}`;
-        let savedResumeObj: any;
-        let savedAtsObj: any;
-        let savedRoadmapObj: any;
-
-        if (isMongoConnected()) {
-          try {
-            const newResume = new Resume({
-              userId: uid,
-              text,
-              filename,
-              contentHash: calculateHash(text),
-              targetRole: role,
-              parsedData: fallbackParsed
-            });
-            await newResume.save();
-            savedResumeObj = newResume.toObject();
-            const resumeId = newResume._id.toString();
-
-            const newAts = new AtsResult({
-              userId: uid,
-              resumeId,
-              ...fallbackAts
-            });
-            await newAts.save();
-            savedAtsObj = newAts.toObject();
-
-            const newRoadmap = new Roadmap({
-              userId: uid,
-              resumeId,
-              ...fallbackRoadmap
-            });
-            await newRoadmap.save();
-            savedRoadmapObj = newRoadmap.toObject();
-          } catch (mErr: any) {
-            console.warn("[server] [Fallback] Mongo save notice:", mErr?.message);
-          }
-        }
-
-        if (!savedResumeObj) {
-          const sRes = localDb.saveResume({ userId: uid, text, filename, parsedData: fallbackParsed });
-          savedResumeObj = { id: sRes._id, ...sRes };
-          const sAts = localDb.saveAtsResult({ userId: uid, resumeId: sRes._id, ...fallbackAts });
-          savedAtsObj = { id: sAts._id, ...sAts };
-          const sRoad = localDb.saveRoadmap({ userId: uid, resumeId: sRes._id, ...fallbackRoadmap });
-          savedRoadmapObj = { id: sRoad._id, ...sRoad };
-        }
-
-        if (uid && !uid.startsWith('guest_')) {
-          await checkAndIncrementUsage(uid, true);
-        }
-
-        return res.json({
-          analysis_id: analysisId,
-          resume: savedResumeObj,
-          ats: savedAtsObj,
-          roadmap: savedRoadmapObj,
-          market: fallbackMarket,
-          fallback: true
-        });
-      } catch (fbErr: any) {
-        console.error("[server] [Critical Fallback Handler Error]:", fbErr);
-        res.status(500).json({ error: error?.message || "Analysis failed. Please try again." });
-      }
+      return res.status(503).json({
+        error: "Gemini AI analysis failed or timed out across all keys. Please click Try Again in a moment — we never return fake or fallback ATS scores.",
+        retryable: true,
+        details: error?.message || "Gemini service unavailable"
+      });
     }
   });
 
@@ -4284,7 +4114,7 @@ Return valid JSON with format:
 
       console.log(`[server] [Document Parser] Processing ${filename} (mime: ${mimeType}, size: ${buffer.length} bytes)`);
 
-      // 1. PDF Handling (Both Word-generated digital PDFs & Image-converted / Scanned / Multi-column PDFs)
+      // 1. PDF Handling (Both Word-generated digital PDFs & Image-converted / Scanned PDFs)
       if (mimeType === 'application/pdf') {
         let streamText = "";
         try {
@@ -4303,31 +4133,25 @@ Return valid JSON with format:
 
         const cleanStream = (streamText || "").trim();
         const lowerStream = cleanStream.toLowerCase();
-        
-        // Strict tokens analysis for fragmented or font-corrupted text (Canva, multi-column, spaced fonts)
         const tokens = cleanStream.split(/\s+/).filter(Boolean);
-        const totalTokens = tokens.length;
-        const singleCharTokens = tokens.filter(t => t.length === 1 && /[a-zA-Z]/.test(t)).length;
         const multiCharWords = tokens.filter(t => t.length >= 2 && /[a-zA-Z]/.test(t));
-        const singleCharRatio = totalTokens > 0 ? (singleCharTokens / totalTokens) : 1;
-
-        // Check for genuine resume structural markers
-        const resumeKeywords = ['experience', 'skills', 'education', 'project', 'work', 'summary', 'developer', 'engineer', 'technolog', 'university', 'college', 'phone', 'email', '@', 'management', 'responsibilit', 'software', 'profile', 'curriculum', 'vitae', 'coursework'];
+        const singleCharTokens = tokens.filter(t => t.length === 1 && /[a-zA-Z]/.test(t));
+        const spacedTextCorruption = tokens.length > 20 && (singleCharTokens.length / tokens.length) > 0.32;
+        
+        // Check for genuine, complete, non-corrupted digital resume content
+        const resumeKeywords = ['experience', 'skills', 'education', 'project', 'work', 'summary', 'developer', 'engineer', 'technolog', 'university', 'college', 'phone', 'email', '@', 'management', 'responsibilit', 'software', 'profile', 'curriculum', 'vitae', 'coursework', 'intern', 'certification', 'marketing', 'analyst', 'design'];
         const matchedKeywordsCount = resumeKeywords.filter(k => lowerStream.includes(k)).length;
         
-        // Quality Gate: Only trust direct stream if length >= 400, multiCharWords >= 55, matchedKeywords >= 3, and singleCharRatio <= 0.32
-        const isDigitalStreamValid = cleanStream.length >= 400 && 
-                                     multiCharWords.length >= 55 && 
-                                     matchedKeywordsCount >= 3 && 
-                                     singleCharRatio <= 0.32;
+        // Require substantial text (>= 400 chars, >= 55 real words, >= 3 markers) and zero spaced-font corruption
+        const isTrueDigitalResume = cleanStream.length >= 400 && multiCharWords.length >= 55 && matchedKeywordsCount >= 3 && !spacedTextCorruption;
 
-        if (isDigitalStreamValid) {
+        if (isTrueDigitalResume) {
           text = cleanStream;
           extractionMethod = "pdf-digital";
-          console.log(`[server] [PDF Parser] Digital PDF text validated (${text.length} characters, ${matchedKeywordsCount} markers, ${multiCharWords.length} words, charRatio: ${singleCharRatio.toFixed(2)}).`);
+          console.log(`[server] [PDF Parser] Clean digital PDF extracted (${text.length} chars, ${multiCharWords.length} words, ${matchedKeywordsCount} markers).`);
         } else {
-          // Scanned image, complex multi-column, or font-corrupted PDF detected — Run Gemini Multimodal Vision OCR with 25s timeout
-          console.log(`[server] [AI Vision] PDF failed digital quality gate (length: ${cleanStream.length}, words: ${multiCharWords.length}, markers: ${matchedKeywordsCount}, singleCharRatio: ${singleCharRatio.toFixed(2)}). Running Gemini Multimodal Vision OCR...`);
+          // Scanned, designed/multi-column (Canva/Figma), or font-encoded PDF — run Gemini Multimodal AI Vision OCR
+          console.log(`[server] [AI Vision] Triggering Gemini Multimodal Vision OCR for PDF (streamChars=${cleanStream.length}, words=${multiCharWords.length}, markers=${matchedKeywordsCount}, corrupted=${spacedTextCorruption})...`);
           try {
             const ocrResponse = await generateContentReliably({
               model: "gemini-3.1-flash-lite",
@@ -4341,35 +4165,28 @@ Return valid JSON with format:
                 },
                 {
                   text: `You are an expert document reading and optical character recognition (OCR) AI.
-This document is a resume or CV PDF (multi-column, stylized, or scanned).
-Perform thorough OCR reading across the entire document including main text, columns, sidebars, headers, and footers. Extract ALL text, candidate background, and career sections with high accuracy:
-1. Candidate Name, Email, Phone, Location, Portfolio / GitHub / LinkedIn links
-2. Profile Summary / Career Objective / Professional Headline
-3. Professional Work Experience (Job Titles, Companies, Dates, Bullet Points, Technologies used)
-4. Skills (Technical Skills, Programming Languages, Frameworks, Tools, Methodologies, Soft Skills)
+Read EVERY page and column of this PDF resume visually from top to bottom and extract ALL text accurately without skipping sidebars or headers:
+1. Candidate Name, Headline / Job Title Banner, Email, Phone, Location, Portfolio / GitHub / LinkedIn links
+2. Profile Summary / Career Objective
+3. Professional Work Experience & Internships (Exact Job Titles, Companies, Dates, Bullet Points, Tools/Technologies)
+4. Skills (Technical Skills, Frameworks, Libraries, Tools, Platforms, Domain Expertise, Soft Skills)
 5. Education (Degrees, Colleges / Universities, Graduation Years, CGPA / Grades)
-6. Projects (Project Names, Tech Stack, Descriptions, Key Features)
+6. Projects (Project Names, Tech Stack, Descriptions, Key Outcomes)
 7. Certifications & Achievements
 
-Transcribe all readable information into clean, full, unshortened text organized by sections.`
+Transcribe all readable information into clean, complete, unshortened text organized clearly by sections.`
                 }
               ]
             });
-            const ocrText = (ocrResponse.text || "").trim();
-            if (ocrText.length >= 50) {
-              text = ocrText;
-              extractionMethod = "pdf-multimodal-vision";
-              console.log(`[server] [AI Vision] Multimodal PDF Vision OCR successful (${text.length} chars).`);
-            } else if (cleanStream.length >= 50) {
+            text = (ocrResponse.text || "").trim();
+            if (!text && cleanStream.length >= 30) {
               text = cleanStream;
-              extractionMethod = "pdf-stream-fallback";
             }
+            extractionMethod = "pdf-scanned-vision";
+            console.log(`[server] [AI Vision] PDF Vision OCR transcription successful (${text.length} chars).`);
           } catch (ocrError: any) {
-            console.error(`[server] [AI Vision] Multimodal PDF OCR failed:`, ocrError.message || ocrError);
-            if (cleanStream.length >= 50) {
-              text = cleanStream;
-              extractionMethod = "pdf-stream-fallback";
-            }
+            console.error(`[server] [AI Vision] PDF Vision processing failed:`, ocrError.message || ocrError);
+            text = cleanStream;
           }
         }
       } 
@@ -4387,7 +4204,6 @@ Transcribe all readable information into clean, full, unshortened text organized
         try {
           const ocrResponse = await generateContentReliably({
             model: "gemini-3.1-flash-lite",
-            timeoutMs: 25000,
             contents: [
               {
                 inlineData: {
@@ -4431,7 +4247,7 @@ Transcribe all readable information into clean, complete text formatted by secti
         });
       }
 
-      // Extract real candidate role, skills, and evidence-first background using Gemini AI (temperature: 0.15, up to 16000 chars)
+      // Extract real candidate role, skills, reasoning, and top 3 recommended target roles using Gemini AI
       let detectedRole = "";
       let currentRole = "";
       let detectedIndustry = "Technology";
@@ -4442,43 +4258,38 @@ Transcribe all readable information into clean, complete text formatted by secti
       let parsedExperience: any[] = [];
       let parsedEducation: any[] = [];
       let parsedSummary = "";
+      let yearsOfExperience = 0;
 
       try {
-        console.log(`[server] [AI Document Analysis] Calling Gemini AI for evidence-first role detection (${text.length} chars)...`);
+        console.log(`[server] [AI Document Analysis] Running deep evidence-based role & profile indexing (${text.length} chars)...`);
         const aiAnalysis = await generateContentReliably({
           model: "gemini-3.1-flash-lite",
-          timeoutMs: 20000,
-          contents: `You are an expert executive talent assessor, recruiter, and resume indexing AI.
-Analyze this resume text and extract the candidate's ACTUAL target profession / primary job title, key skills, experience, and background evidence.
+          timeoutMs: 22000,
+          contents: `You are an elite executive technical & non-technical career strategist and ATS profiler.
+Carefully read EVERY section of the candidate's resume below before making any decision.
 
-CRITICAL INSTRUCTIONS FOR TARGET ROLE ASSIGNMENT:
-1. Examine:
-   a. Explicit Resume Headline, Title, Profile Summary, and Career Objective.
-   b. Most recent and longest professional work experience or internships.
-   c. Dominant tech stacks, tools, frameworks, and hands-on projects (>60% focus).
-2. Work across ALL domains (technical and non-technical):
-   - Agentic AI / Generative AI / LLM Engineering: if they build AI agents, LangChain, LangGraph, tool calling, prompt systems, assign "Agentic AI Developer" or "AI Systems Engineer".
-   - Web / Frontend: if React, Vue, Next.js, CSS, assign "Frontend Developer" or "Full Stack Developer".
-   - Backend / APIs: if Node.js, Express, Go, Python APIs, Spring, Microservices, assign "Backend Developer".
-   - Data & ML: if Pandas, SQL, ML models, PyTorch, Scikit, assign "Data Scientist", "Data Analyst", or "Machine Learning Engineer".
-   - Cloud / DevOps: if Docker, Kubernetes, AWS, CI/CD, Terraform, assign "DevOps Engineer" or "Cloud Platform Engineer".
-   - Mobile: if React Native, Flutter, Swift, Kotlin, assign "Mobile Application Developer".
-   - Cybersecurity: if penetration testing, SIEM, SOC, vulnerability management, assign "Cybersecurity Analyst".
-   - Non-technical / Business / Design: Product Manager, UI/UX Designer, Marketing Strategist, Financial Analyst, HR Operations, etc.
-3. NEVER assign generic titles like "Software Engineer", "Student", or "Intern" if their projects, skills, or experience demonstrate a specific specialization. Assign the exact, evidence-based professional title.
-4. Formulate "roleReasoning": Exactly 1-2 concise sentences directly citing specific evidence from their resume (e.g. key projects, tools, titles) that proves why this role was assigned.
-5. Provide "suggestedTargetRoles": Top 3-4 ranked target roles for this candidate with match percentage (80-98%) and a 1-sentence reason.
+STEP-BY-STEP ANALYSIS RULES (STRICT):
+1. EXPLICIT HEADLINE / OBJECTIVE CHECK: Look at the top banner/headline, summary, or career objective. Does the candidate explicitly state their role or goal (e.g., "Data Analyst", "Agentic AI Engineer", "UI/UX Designer", "Digital Marketing Manager", "Java Backend Developer", "Chartered Accountant")?
+2. EXPERIENCE & PROJECT EVIDENCE: Inspect their most recent work experience, internships, and top 2-3 hands-on projects. What tools, frameworks, workflows, or domain problems do they actually spend >60% of their resume demonstrating?
+3. SPECIALIZATION OVER GENERIC LABELS:
+   - NEVER lazily label someone "Software Engineer" if their resume clearly shows a specialized track (e.g., "Frontend Developer", "Full Stack Developer", "Backend Developer", "Agentic AI Developer", "Generative AI Engineer", "Machine Learning Engineer", "Data Analyst", "Data Scientist", "DevOps Engineer", "Cloud Architect", "Mobile App Developer", "Flutter Developer", "QA Automation Engineer", "Cybersecurity Analyst", "UI/UX Designer", "Product Manager", "Digital Marketing Specialist", "Business Analyst", "Financial Analyst", "HR Specialist", etc.).
+   - For freshers/students whose title says "Student" or "Intern", determine the true **Target Job Role** from their projects, skills, and coursework (e.g., "Agentic AI Developer", "Full Stack Developer", "Data Analyst") rather than returning "Student" or "Intern".
+   - If the candidate IS a non-tech professional (Marketing, Finance, HR, Sales, Operations, Design, Mechanical, Civil, Healthcare, Law, Teaching), identify their exact non-tech role and industry accurately!
+4. REASONING & TOP 4 TARGET ROLES & TRANSFERABLE PATHWAYS:
+   - First write "roleReasoning": a concise 1-2 sentence explanation citing specific technologies, projects, or job titles from this exact resume proving why you selected this primary target role.
+   - Then set "detectedRole" to the SINGLE #1 best-fit target job title for this candidate.
+   - Then provide "suggestedTargetRoles": EXACTLY 4 ranked target roles & transferable career pathways for this candidate with realistic "matchPercent" (e.g. 94, 86, 78, 70) and a concise "reason" explaining how their existing skills transfer into each pathway.
 
-Resume Text:
+Resume text:
 ${text.slice(0, 16000)}
 
-Return ONLY a valid JSON object matching this schema:
+Return ONLY a valid JSON object matching this exact schema:
 {
   "candidateName": string,
-  "detectedRole": string,
   "currentRole": string,
-  "detectedIndustry": string,
   "roleReasoning": string,
+  "detectedRole": string,
+  "detectedIndustry": string,
   "suggestedTargetRoles": [
     {
       "role": string,
@@ -4512,45 +4323,71 @@ Return ONLY a valid JSON object matching this schema:
         });
 
         const parsedJson = JSON.parse(cleanJSONResponse(aiAnalysis.text || "{}"));
-        if (parsedJson.detectedRole) detectedRole = String(parsedJson.detectedRole).trim();
+        if (parsedJson.detectedRole && typeof parsedJson.detectedRole === 'string') {
+          detectedRole = parsedJson.detectedRole.trim();
+        }
         if (parsedJson.currentRole) currentRole = String(parsedJson.currentRole).trim();
+        if (parsedJson.roleReasoning) roleReasoning = String(parsedJson.roleReasoning).trim();
         if (parsedJson.detectedIndustry) detectedIndustry = String(parsedJson.detectedIndustry).trim();
         if (parsedJson.candidateName) candidateName = String(parsedJson.candidateName).trim();
-        if (parsedJson.roleReasoning) roleReasoning = String(parsedJson.roleReasoning).trim();
-        if (Array.isArray(parsedJson.suggestedTargetRoles) && parsedJson.suggestedTargetRoles.length > 0) {
-          suggestedTargetRoles = parsedJson.suggestedTargetRoles.map((s: any) => ({
-            role: String(s.role || '').trim(),
-            matchPercent: Number(s.matchPercent) || 85,
-            reason: String(s.reason || '').trim()
-          })).filter((s: any) => s.role);
+        if (typeof parsedJson.yearsOfExperience === 'number') yearsOfExperience = parsedJson.yearsOfExperience;
+        if (Array.isArray(parsedJson.suggestedTargetRoles)) {
+          suggestedTargetRoles = parsedJson.suggestedTargetRoles
+            .filter((item: any) => item && item.role)
+            .slice(0, 4);
         }
         if (Array.isArray(parsedJson.skills) && parsedJson.skills.length > 0) parsedSkills = parsedJson.skills;
         if (Array.isArray(parsedJson.experience) && parsedJson.experience.length > 0) parsedExperience = parsedJson.experience;
         if (Array.isArray(parsedJson.education) && parsedJson.education.length > 0) parsedEducation = parsedJson.education;
         if (parsedJson.summary) parsedSummary = parsedJson.summary;
 
-        if (!detectedRole && parsedExperience.length > 0 && parsedExperience[0]?.role) {
+        // If AI populated suggestedTargetRoles[0] but left detectedRole blank, take top suggestion
+        if (!detectedRole && suggestedTargetRoles.length > 0) {
+          detectedRole = suggestedTargetRoles[0].role;
+        }
+        if (!detectedRole && parsedExperience[0]?.role) {
           detectedRole = parsedExperience[0].role;
         }
 
-        console.log(`[server] [AI Document Analysis] Verified Role: "${detectedRole}", Candidate: "${candidateName}", Skills Count: ${parsedSkills.length}`);
+        if (!detectedRole) {
+          throw new Error("AI could not identify a target role from the extracted resume content.");
+        }
+
+        // Ensure #1 detectedRole appears first in suggestedTargetRoles
+        if (!suggestedTargetRoles.some(r => r.role.toLowerCase() === detectedRole.toLowerCase())) {
+          suggestedTargetRoles.unshift({
+            role: detectedRole,
+            matchPercent: 95,
+            reason: roleReasoning || "Primary match from resume experience and core skill cluster"
+          });
+          suggestedTargetRoles = suggestedTargetRoles.slice(0, 4);
+        }
+
+        console.log(`[server] [AI Document Analysis] Verified Role: "${detectedRole}" | Reasoning: "${roleReasoning}" | Skills: ${parsedSkills.length}`);
       } catch (aiErr: any) {
-        console.error(`[server] [AI Document Analysis] Gemini AI parsing error:`, aiErr.message || aiErr);
+        console.error(`[server] [AI Document Analysis] Real Gemini AI parsing failed across pool:`, aiErr.message);
+        logServerSystemError({
+          type: 'API_FAILURE',
+          severity: 'CRITICAL',
+          component: 'Resume Role Analysis',
+          message: `Failed to run Gemini AI role indexing: ${aiErr?.message || aiErr}`
+        });
         return res.status(503).json({
-          error: "AI Resume Intelligence is temporarily overloaded. Please try again in a few moments."
+          error: "Gemini AI could not complete resume indexing right now. Please click Try Again in a few seconds so we never assign a wrong default role."
         });
       }
 
-      console.log(`[server] [Document Parser] Returning verified resume (${text.length} chars, role: ${detectedRole}).`);
+      console.log(`[server] [Document Parser] Returning AI-verified resume (${text.length} chars, role: ${detectedRole}).`);
       res.json({
         text,
         extractionMethod,
         detectedRole,
-        currentRole,
-        detectedIndustry,
-        candidateName,
+        currentRole: currentRole || detectedRole,
         roleReasoning,
         suggestedTargetRoles,
+        detectedIndustry,
+        candidateName,
+        yearsOfExperience,
         skills: parsedSkills,
         experience: parsedExperience,
         education: parsedEducation,

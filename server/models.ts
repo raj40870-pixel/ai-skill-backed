@@ -54,6 +54,7 @@ const ResumeSchema = new mongoose.Schema({
 const AtsResultSchema = new mongoose.Schema({
   userId: { type: String, required: true, index: true },
   resumeId: { type: String, required: true },
+  evaluatedRole: { type: String, default: '' },
   score: { type: Number, required: true },
   market_match: { type: Number, default: 0 },
   label: { type: String, default: 'Moderate Traction' },
@@ -61,6 +62,7 @@ const AtsResultSchema = new mongoose.Schema({
   breakdown: { type: [mongoose.Schema.Types.Mixed], default: [] },
   top_3_fixes: { type: [String], default: [] },
   priority_fixes: { type: [mongoose.Schema.Types.Mixed], default: [] },
+  bullet_rewrites: { type: [mongoose.Schema.Types.Mixed], default: [] },
   createdAt: { type: Date, default: Date.now }
 });
 
