@@ -13,19 +13,24 @@ interface LocalDbData {
   systemErrorLogs?: any[];
 }
 
+let cachedDb: LocalDbData | null = null;
+
 function readDb(): LocalDbData {
+  if (cachedDb) return cachedDb;
   try {
     if (!fs.existsSync(DB_FILE)) {
-      const defaultData = { users: [], resumes: [], atsResults: [], roadmaps: [], chatSessions: [], supportTickets: [], systemErrorLogs: [] };
-      fs.writeFileSync(DB_FILE, JSON.stringify(defaultData, null, 2), 'utf8');
-      return defaultData;
+      const defaultData: LocalDbData = { users: [], resumes: [], atsResults: [], roadmaps: [], chatSessions: [], supportTickets: [], systemErrorLogs: [] };
+      fs.writeFileSync(DB_FILE, JSON.stringify(defaultData), 'utf8');
+      cachedDb = defaultData;
+      return cachedDb;
     }
     const content = fs.readFileSync(DB_FILE, 'utf8');
     const parsed = JSON.parse(content || '{"users":[],"resumes":[],"atsResults":[],"roadmaps":[],"chatSessions":[],"supportTickets":[],"systemErrorLogs":[]}');
     if (!parsed.chatSessions) parsed.chatSessions = [];
     if (!parsed.supportTickets) parsed.supportTickets = [];
     if (!parsed.systemErrorLogs) parsed.systemErrorLogs = [];
-    return parsed;
+    cachedDb = parsed;
+    return cachedDb!;
   } catch (err) {
     console.error("[localDb] Error reading file:", err);
     return { users: [], resumes: [], atsResults: [], roadmaps: [], chatSessions: [], supportTickets: [], systemErrorLogs: [] };
@@ -33,8 +38,9 @@ function readDb(): LocalDbData {
 }
 
 function writeDb(data: LocalDbData) {
+  cachedDb = data;
   try {
-    fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2), 'utf8');
+    fs.writeFileSync(DB_FILE, JSON.stringify(data), 'utf8');
   } catch (err) {
     console.error("[localDb] Error writing file:", err);
   }

@@ -12,8 +12,31 @@ import dotenv from "dotenv";
 import cors from "cors";
 import nodemailer from "nodemailer";
 import crypto from "crypto";
+import compression from "compression";
 
 dotenv.config();
+
+const aiResponseCache = new Map<string, { data: any; expiresAt: number }>();
+const AI_CACHE_TTL_MS = 15 * 60 * 1000;
+const AI_CACHE_MAX_ENTRIES = 200;
+
+function getCachedAiResponse(cacheKey: string): any | null {
+  const hit = aiResponseCache.get(cacheKey);
+  if (!hit) return null;
+  if (Date.now() > hit.expiresAt) {
+    aiResponseCache.delete(cacheKey);
+    return null;
+  }
+  return hit.data;
+}
+
+function setCachedAiResponse(cacheKey: string, data: any) {
+  if (aiResponseCache.size >= AI_CACHE_MAX_ENTRIES) {
+    const oldestKey = aiResponseCache.keys().next().value;
+    if (oldestKey) aiResponseCache.delete(oldestKey);
+  }
+  aiResponseCache.set(cacheKey, { data, expiresAt: Date.now() + AI_CACHE_TTL_MS });
+}
 import { User, Resume, AtsResult, Roadmap, ChatSession, SupportTicket, SystemErrorLog } from "./server/models";
 import { localDb } from "./server/localDb";
 
@@ -531,8 +554,7 @@ async function generateContentReliably(options: {
 
   // Verified active production Gemini model order (gemini-3.1-flash-lite is fastest & healthy across pool)
   const availableFallbacks = [
-    "gemini-3.1-flash-lite",
-    "gemini-3.8-flash"
+    "gemini-3.1-flash-lite"
   ];
 
   const modelsToTry: string[] = [];
@@ -540,8 +562,7 @@ async function generateContentReliably(options: {
     // Prefer gemini-3.1-flash-lite ahead of overloaded models
     if (options.model === "gemini-3.8-flash" || options.model === "gemini-flash-latest") {
       modelsToTry.push("gemini-3.1-flash-lite");
-    }
-    if (!modelsToTry.includes(options.model)) {
+    } else {
       modelsToTry.push(options.model);
     }
   }
@@ -556,8 +577,8 @@ async function generateContentReliably(options: {
   const pool = getGeminiApiKeyPool();
   const totalKeys = Math.max(1, pool.length);
 
-  // Outer loop: Try all available API keys from the pool
-  for (let keyAttempt = 0; keyAttempt < Math.min(totalKeys, 6); keyAttempt++) {
+  // Outer loop: Try up to 3 healthy API keys from the pool for bounded tail latency
+  for (let keyAttempt = 0; keyAttempt < Math.min(totalKeys, 3); keyAttempt++) {
     const { key, client, poolSize, keyIndex } = getNextHealthyKey(exhaustedKeys);
     if (!key) break;
     const keyPreview = key ? `${key.substring(0, 6)}...${key.slice(-4)}` : "None";
@@ -753,15 +774,13 @@ function cleanJSONResponse(text: string): string {
   // Sometimes models output text before or after the JSON
   const start = clean.indexOf("{");
   const end = clean.lastIndexOf("}");
-  if (start !== -1 && end !== -1 && end > start) {
+  const arrStart = clean.indexOf("[");
+  const arrEnd = clean.lastIndexOf("]");
+
+  if (arrStart !== -1 && arrEnd !== -1 && arrEnd > arrStart && (start === -1 || arrStart < start)) {
+    clean = clean.substring(arrStart, arrEnd + 1);
+  } else if (start !== -1 && end !== -1 && end > start) {
     clean = clean.substring(start, end + 1);
-  } else {
-    // If it's an array
-    const arrStart = clean.indexOf("[");
-    const arrEnd = clean.lastIndexOf("]");
-    if (arrStart !== -1 && arrEnd !== -1 && arrEnd > arrStart) {
-      clean = clean.substring(arrStart, arrEnd + 1);
-    }
   }
   
   return clean;
@@ -1179,6 +1198,7 @@ async function startServer() {
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin']
   }));
   app.options('*', cors());
+  app.use(compression({ threshold: 1024 }));
   app.use(express.json({ limit: '50mb' }));
   app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
@@ -2687,28 +2707,28 @@ async function startServer() {
       const isAdmin = !!(requestingUser?.email && ADMIN_EMAILS.includes(requestingUser.email.toLowerCase())) || uid === 'admin';
 
       if (isMongoConnected()) {
-        // Fetch only the user's own resumes for their personal History tab
+        // Fetch user's resumes, ATS results, and roadmaps with lean parallel queries
         const query = { userId: uid };
-        const resumesList = await Resume.find(query).sort({ createdAt: -1 });
+        const [resumesList, atsList, roadmapsList] = await Promise.all([
+          Resume.find(query).sort({ createdAt: -1 }).lean(),
+          AtsResult.find({ userId: uid }).lean(),
+          Roadmap.find({ userId: uid }).lean()
+        ]);
         
-        // Fetch users map for owner labeling
-        const userIds = Array.from(new Set(resumesList.map(r => r.userId).filter(Boolean)));
-        const usersList = await User.find({ uid: { $in: userIds } });
+        const userIds = Array.from(new Set(resumesList.map((r: any) => r.userId).filter(Boolean)));
+        const usersList = userIds.length > 0 ? await User.find({ uid: { $in: userIds } }).lean() : [];
         const userMap = new Map();
-        usersList.forEach(u => {
+        usersList.forEach((u: any) => {
           userMap.set(u.uid, { name: u.displayName || 'User', email: u.email });
         });
-
-        const atsList = await AtsResult.find({ userId: uid });
-        const roadmapsList = await Roadmap.find({ userId: uid });
         
         const atsMap = new Map();
-        atsList.forEach(ats => {
+        atsList.forEach((ats: any) => {
           if (ats.resumeId) atsMap.set(ats.resumeId.toString(), ats);
         });
 
         const roadmapMap = new Map();
-        roadmapsList.forEach(roadmap => {
+        roadmapsList.forEach((roadmap: any) => {
           if (roadmap.resumeId) roadmapMap.set(roadmap.resumeId.toString(), roadmap);
         });
 
@@ -2968,7 +2988,7 @@ async function startServer() {
         const filter: any = { userId: uid };
         if (resumeId) filter.resumeId = resumeId;
 
-        const latestAts = await AtsResult.findOne(filter).sort({ createdAt: -1 });
+        const latestAts = await AtsResult.findOne(filter).sort({ createdAt: -1 }).lean();
         res.json(latestAts || null);
       } else {
         const latestAts = localDb.getLatestAtsResult(uid, resumeId as string);
@@ -3034,7 +3054,7 @@ async function startServer() {
         const filter: any = { userId: uid };
         if (resumeId) filter.resumeId = resumeId;
 
-        const latestRoadmap = await Roadmap.findOne(filter).sort({ createdAt: -1 });
+        const latestRoadmap = await Roadmap.findOne(filter).sort({ createdAt: -1 }).lean();
         res.json(latestRoadmap || null);
       } else {
         const latestRoadmap = localDb.getLatestRoadmap(uid, resumeId as string);
@@ -3487,9 +3507,16 @@ async function startServer() {
       const cityLower = (city || "").toLowerCase();
       const skillsStr = Array.isArray(skills) && skills.length > 0 ? skills.slice(0, 8).join(", ") : "general engineering";
 
+      const salaryCacheKey = `salary:${cityLower}:${roleStr.toLowerCase()}:${track}:${mapSelectedModelToGemini(model)}`;
+      const cachedSalary = getCachedAiResponse(salaryCacheKey);
+      if (cachedSalary) {
+        return res.json(cachedSalary);
+      }
+
       try {
         const response = await generateContentReliably({
           model: mapSelectedModelToGemini(model),
+          timeoutMs: 18000,
           contents: `Conduct a real-time market search to analyze current salary benchmarks for a "${roleStr}" in "${city}".
           Locate actual current market offers and regional indices.
           
@@ -3525,7 +3552,9 @@ async function startServer() {
           }
         });
 
-        res.json(JSON.parse(cleanJSONResponse(response.text || "{}")));
+        const parsedSalary = JSON.parse(cleanJSONResponse(response.text || "{}"));
+        setCachedAiResponse(salaryCacheKey, parsedSalary);
+        res.json(parsedSalary);
       } catch (aiError: any) {
         console.error("[server] [AI Error] Salary insights failed:", aiError?.message || aiError);
         res.status(503).json({ 
@@ -3547,6 +3576,11 @@ async function startServer() {
     try {
       const { skills = [], targetRole = "Software Engineer", parsedResume, model } = req.body;
       const skillsString = (skills || []).join(", ");
+      const interviewCacheKey = `interview:${targetRole.toLowerCase()}:${skillsString.slice(0, 120).toLowerCase()}`;
+      const cachedQuestions = !parsedResume ? getCachedAiResponse(interviewCacheKey) : null;
+      if (cachedQuestions) {
+        return res.json(cachedQuestions);
+      }
       
       const resumeContext = parsedResume ? `
       CANDIDATE PROJECTS: ${JSON.stringify(parsedResume.projects || [])}
@@ -3556,6 +3590,7 @@ async function startServer() {
       try {
         const response = await generateContentReliably({
           model: mapSelectedModelToGemini(model),
+          timeoutMs: 18000,
           contents: `Based on these engineering skills: ${skillsString}, target role: "${targetRole}", and candidate resume context:
           ${resumeContext}
           
@@ -3574,7 +3609,11 @@ async function startServer() {
             responseMimeType: "application/json",
           }
         });
-        res.json(JSON.parse(cleanJSONResponse(response.text || "[]")));
+        const parsedQuestions = JSON.parse(cleanJSONResponse(response.text || "[]"));
+        if (!parsedResume && Array.isArray(parsedQuestions) && parsedQuestions.length > 0) {
+          setCachedAiResponse(interviewCacheKey, parsedQuestions);
+        }
+        res.json(parsedQuestions);
       } catch (aiError: any) {
         // Safe customized 5-question fallback based on actual projects and skills
         const project = parsedResume?.projects?.[0]?.name || "your primary production project";
@@ -3808,8 +3847,12 @@ Return valid JSON with format:
       const analysisId = `analysis_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
       console.log(`[server] [Analysis] Starting Stage 1-5 Pipeline. ID: ${analysisId}, User: ${uid}`);
 
-      // 1. Contextual Indexing & Target-Role Dependent 8-Factor ATS Audit (Stages 1 & 2) — ZERO FALLBACK
-      console.log(`[server] [Analysis] [Stage 1-2] Running strict target-role ATS audit for "${role}"...`);
+      // Parallelize Stages 1-2 (ATS + Profile), Stages 3-4 (Market + Gaps), and Stage 5 (6-Month Roadmap) across multi-key pool
+      const pipelineStartMs = Date.now();
+      const activeGeminiModel = mapSelectedModelToGemini(model);
+      const resumeSnippet = text.slice(0, 6000);
+      console.log(`[server] [Analysis] Launching parallel Stage 1-5 Gemini execution for "${role}"...`);
+
       const stage12Prompt = `
         Perform a rigorous, enterprise-grade, TARGET-ROLE DEPENDENT ATS (Applicant Tracking System) audit of this resume specifically for the target role: "${role}".
         Simulate top industry parsers like Workday, Taleo, Greenhouse, Jobscan, and Resume Worded.
@@ -3867,30 +3910,14 @@ Return valid JSON with format:
         Resume: ${text.slice(0, 16000)}
       `;
 
-      const stage12Result = await generateContentReliably({
-        model: mapSelectedModelToGemini(model),
-        timeoutMs: 25000,
-        contents: stage12Prompt,
-        config: { responseMimeType: "application/json", temperature: 0.15 }
-      });
-      const stage12Data = JSON.parse(cleanJSONResponse(stage12Result.text || "{}"));
-      if (!stage12Data?.atsResult || !Array.isArray(stage12Data?.atsResult?.breakdown) || stage12Data.atsResult.breakdown.length === 0) {
-        throw new Error("Invalid 8-factor ATS structure returned by Gemini AI");
-      }
-      stage12Data.atsResult = normalizeAndVerifyAtsResult(stage12Data.atsResult, role);
-      console.log(`[server] [Analysis] [Stage 1-2 AI SUCCESS] Role: "${role}" | Verified ATS Score: ${stage12Data.atsResult.score} | Rewrites: ${stage12Data.atsResult.bullet_rewrites?.length || 0}`);
-
-      const extractedSkills = Array.isArray(stage12Data?.parsedData?.skills) && stage12Data.parsedData.skills.length > 0
-        ? stage12Data.parsedData.skills
-        : [role];
-
-      // 2. Market Data Synthesis & Structural Gap Analysis (Stages 3 & 4)
-      console.log(`[server] [Analysis] [Stage 3-4] Running live market benchmarks & gap analysis for ${role}...`);
       const stage34Prompt = `
-        As a Career Intelligence AI, conduct Market Research for a "${role}" in "${targetRegion}".
+        As a Career Intelligence AI, conduct Market Research and Structural Gap Analysis for a "${role}" in "${targetRegion}".
         
-        Stage 3 (Market Data Synthesis): Pull real-time salary benchmarks, hiring demand trends, and top skill requirements.
-        Stage 4 (Structural Gap Analysis): Based on candidate skills (${extractedSkills.join(", ")}), isolate exactly what is missing for a 'Strong' match.
+        Stage 3 (Market Data Synthesis): Pull real-time 2026 salary benchmarks, hiring demand trends, and top skill requirements.
+        Stage 4 (Structural Gap Analysis): Compare the candidate's resume below against top-tier "${role}" requirements and isolate missing skills for a Strong match.
+        
+        Candidate Resume:
+        ${resumeSnippet}
         
         Return a valid JSON object:
         {
@@ -3916,23 +3943,11 @@ Return valid JSON with format:
         }
       `;
 
-      const stage34Result = await generateContentReliably({
-        model: mapSelectedModelToGemini(model),
-        timeoutMs: 25000,
-        contents: stage34Prompt,
-        config: { responseMimeType: "application/json" }
-      });
-      const stage34Data = JSON.parse(cleanJSONResponse(stage34Result.text || "{}"));
-      if (!stage34Data?.marketAnalysis || !stage34Data?.gapAnalysis) {
-        throw new Error("Invalid Market & Gap structure returned by Gemini AI");
-      }
-      console.log(`[server] [Analysis] [Stage 3-4 AI SUCCESS] Market Benchmark: ${stage34Data.marketAnalysis?.salaryRange}, Missing Skills: ${stage34Data.gapAnalysis?.missing_skills?.length || 0}`);
-
-      // 3. Final Career Mapping (Stage 5)
-      console.log(`[server] [Analysis] [Stage 5] Synthesizing Final Career Roadmap for "${role}"...`);
       const stage5Prompt = `
-        Generate a 6-month specialized "Career Flight Path" to become a top-tier "${role}".
-        Base this on the identified gaps: ${JSON.stringify(stage34Data?.gapAnalysis?.missing_skills || [])}.
+        Generate a 6-month specialized "Career Flight Path" to help this candidate become a top-tier "${role}" in "${targetRegion}", prioritizing the biggest gaps visible in their resume.
+        
+        Candidate Resume:
+        ${resumeSnippet}
         
         Return a valid JSON object for a Roadmap:
         {
@@ -3968,17 +3983,44 @@ Return valid JSON with format:
         }
       `;
 
-      const stage5Result = await generateContentReliably({
-        model: mapSelectedModelToGemini(model),
-        timeoutMs: 25000,
-        contents: stage5Prompt,
-        config: { responseMimeType: "application/json" }
-      });
+      const [stage12Result, stage34Result, stage5Result] = await Promise.all([
+        generateContentReliably({
+          model: activeGeminiModel,
+          timeoutMs: 16000,
+          contents: stage12Prompt,
+          config: { responseMimeType: "application/json", temperature: 0.15 }
+        }),
+        generateContentReliably({
+          model: activeGeminiModel,
+          timeoutMs: 16000,
+          contents: stage34Prompt,
+          config: { responseMimeType: "application/json", temperature: 0.2 }
+        }),
+        generateContentReliably({
+          model: activeGeminiModel,
+          timeoutMs: 16000,
+          contents: stage5Prompt,
+          config: { responseMimeType: "application/json", temperature: 0.2 }
+        })
+      ]);
+
+      const stage12Data = JSON.parse(cleanJSONResponse(stage12Result.text || "{}"));
+      if (!stage12Data?.atsResult || !Array.isArray(stage12Data?.atsResult?.breakdown) || stage12Data.atsResult.breakdown.length === 0) {
+        throw new Error("Invalid 8-factor ATS structure returned by Gemini AI");
+      }
+      stage12Data.atsResult = normalizeAndVerifyAtsResult(stage12Data.atsResult, role);
+
+      const stage34Data = JSON.parse(cleanJSONResponse(stage34Result.text || "{}"));
+      if (!stage34Data?.marketAnalysis || !stage34Data?.gapAnalysis) {
+        throw new Error("Invalid Market & Gap structure returned by Gemini AI");
+      }
+
       const stage5Data = JSON.parse(cleanJSONResponse(stage5Result.text || "{}"));
       if (!stage5Data?.sprints || !Array.isArray(stage5Data.sprints) || stage5Data.sprints.length === 0) {
         throw new Error("Invalid Roadmap structure returned by Gemini AI");
       }
-      console.log(`[server] [Analysis] [Stage 5 AI SUCCESS] Real Roadmap Sprints: ${stage5Data.sprints?.length || 0}`);
+
+      console.log(`[server] [Analysis] Parallel Stages 1-5 finished in ${Date.now() - pipelineStartMs}ms | Role: "${role}" | ATS: ${stage12Data.atsResult.score} | Sprints: ${stage5Data.sprints.length}`);
 
       // 4. Save to Database (MongoDB or local JSON database)
       let savedResumeObj: any;
@@ -4004,9 +4046,6 @@ Return valid JSON with format:
             resumeId: resumeId,
             ...stage12Data.atsResult
           });
-          await newAts.save();
-          savedAtsObj = newAts.toObject();
-
           const newRoadmap = new Roadmap({
             userId: uid,
             resumeId: resumeId,
@@ -4014,7 +4053,8 @@ Return valid JSON with format:
             marketAnalysis: stage34Data.marketAnalysis,
             skill_gap_report: stage34Data.gapAnalysis
           });
-          await newRoadmap.save();
+          await Promise.all([newAts.save(), newRoadmap.save()]);
+          savedAtsObj = newAts.toObject();
           savedRoadmapObj = newRoadmap.toObject();
         } catch (dbErr: any) {
           console.warn("[server] [Analysis] Mongo save notice, storing in local db:", dbErr?.message);
@@ -4417,9 +4457,16 @@ Return ONLY a valid JSON object matching this exact schema:
         return res.status(400).json({ error: "Missing resume text for comparison" });
       }
 
+      const marketCacheKey = `market:${roleStr.toLowerCase()}:${regionStr.toLowerCase()}:${calculateHash(rText).slice(0, 16)}`;
+      const cachedMarket = getCachedAiResponse(marketCacheKey);
+      if (cachedMarket) {
+        return res.json(cachedMarket);
+      }
+
       try {
         const response = await generateContentReliably({
           model: mapSelectedModelToGemini(model),
+          timeoutMs: 22000,
           contents: `You are "Career Nav AI - Global Market Analyzer". Your core directive is to produce a live market analysis of the candidate's resume vs "${roleStr}" in the selected region: "${regionStr}".
 
           CRITICAL AND ABSOLUTE RULE: 
@@ -4491,7 +4538,7 @@ Return ONLY a valid JSON object matching this exact schema:
             }
           }
 
-          Resume input text: ${rText}`,
+          Resume input text: ${rText.slice(0, 12000)}`,
           config: {
             responseMimeType: "application/json",
           }
@@ -4499,6 +4546,7 @@ Return ONLY a valid JSON object matching this exact schema:
 
         const jsonText = cleanJSONResponse(response.text || "{}");
         const parsedData = JSON.parse(jsonText);
+        setCachedAiResponse(marketCacheKey, parsedData);
         res.json(parsedData);
       } catch (aiError: any) {
         console.error("[server] [AI Error] Market comparison failed:", aiError?.message || aiError);

@@ -50,10 +50,13 @@ const ResumeSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now }
 });
 
+ResumeSchema.index({ userId: 1, createdAt: -1 });
+ResumeSchema.index({ userId: 1, contentHash: 1, targetRole: 1 });
+
 // ATS Result Schema
 const AtsResultSchema = new mongoose.Schema({
   userId: { type: String, required: true, index: true },
-  resumeId: { type: String, required: true },
+  resumeId: { type: String, required: true, index: true },
   evaluatedRole: { type: String, default: '' },
   score: { type: Number, required: true },
   market_match: { type: Number, default: 0 },
@@ -65,10 +68,11 @@ const AtsResultSchema = new mongoose.Schema({
   bullet_rewrites: { type: [mongoose.Schema.Types.Mixed], default: [] },
   createdAt: { type: Date, default: Date.now }
 });
+AtsResultSchema.index({ userId: 1, resumeId: 1, createdAt: -1 });
 
 const RoadmapSchema = new mongoose.Schema({
   userId: { type: String, required: true, index: true },
-  resumeId: { type: String, required: true },
+  resumeId: { type: String, required: true, index: true },
   title: { type: String },
   sprints: { type: [mongoose.Schema.Types.Mixed], default: [] },
   salary_projection: { type: mongoose.Schema.Types.Mixed, default: {} },
@@ -78,6 +82,7 @@ const RoadmapSchema = new mongoose.Schema({
   expertTip: { type: String },
   createdAt: { type: Date, default: Date.now }
 });
+RoadmapSchema.index({ userId: 1, resumeId: 1, createdAt: -1 });
 
 const ChatSessionSchema = new mongoose.Schema({
   userId: { type: String, required: true, index: true },
@@ -96,6 +101,7 @@ const ChatSessionSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now }
 });
+ChatSessionSchema.index({ userId: 1, updatedAt: -1 });
 
 const SupportTicketSchema = new mongoose.Schema({
   ticketId: { type: String, required: true, unique: true, index: true },
