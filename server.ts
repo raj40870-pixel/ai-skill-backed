@@ -1965,6 +1965,71 @@ async function startServer() {
     }
   });
 
+  // Admin only endpoint to permanently delete an account and all associated data
+  app.delete("/api/admin/users/:identifier", authenticateToken, async (req: any, res: any) => {
+    try {
+      const adminEmail = (req.user?.email || '').toLowerCase().trim();
+      const isAdmin = ADMIN_EMAILS.includes(adminEmail) || req.user?.plan === 'ENTERPRISE_ADMIN' || req.user?.plan === 'ADMIN' || req.user?.isAdmin === true;
+      if (!isAdmin) {
+        return res.status(403).json({ error: "Access denied. Admin only." });
+      }
+
+      const rawIdentifier = req.params.identifier || '';
+      const identifier = decodeURIComponent(rawIdentifier).trim();
+      if (!identifier) {
+        return res.status(400).json({ error: "User identifier (uid or email) is required." });
+      }
+
+      // Safeguard: Never allow deleting the primary super-admins
+      if (ADMIN_EMAILS.includes(identifier.toLowerCase())) {
+        return res.status(400).json({ error: "Protected Super Admin accounts cannot be deleted." });
+      }
+
+      let deletedUid = identifier;
+
+      if (isMongoConnected()) {
+        const userDoc = await User.findOne({
+          $or: [
+            { uid: identifier },
+            { email: { $regex: new RegExp(`^${identifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') } }
+          ]
+        });
+
+        if (userDoc) {
+          if (ADMIN_EMAILS.includes((userDoc.email || '').toLowerCase())) {
+            return res.status(400).json({ error: "Protected Super Admin accounts cannot be deleted." });
+          }
+          deletedUid = userDoc.uid;
+          await User.deleteOne({ _id: userDoc._id });
+        } else {
+          await User.deleteMany({
+            $or: [
+              { uid: identifier },
+              { email: { $regex: new RegExp(`^${identifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') } }
+            ]
+          });
+        }
+
+        // Cascade delete all resumes, ats results, roadmaps, and chat sessions
+        await Promise.allSettled([
+          Resume.deleteMany({ userId: deletedUid }),
+          AtsResult.deleteMany({ userId: deletedUid }),
+          Roadmap.deleteMany({ userId: deletedUid }),
+          ChatSession.deleteMany({ userId: deletedUid }),
+          SupportTicket.deleteMany({ userId: deletedUid })
+        ]);
+      } else {
+        localDb.deleteUser(identifier);
+      }
+
+      console.log(`[server] [Admin] Account ${identifier} (UID: ${deletedUid}) permanently removed by Admin ${adminEmail}`);
+      res.json({ success: true, message: `Account ${identifier} and associated data successfully removed.` });
+    } catch (err: any) {
+      console.error("[server] [Admin Delete User Error]:", err);
+      res.status(500).json({ error: err.message || "Failed to delete user" });
+    }
+  });
+
   // --- SUPPORT & ISSUE TRACKER DESK ENDPOINTS ---
 
   // 1. Submit a new issue/ticket (Public or Authenticated)
