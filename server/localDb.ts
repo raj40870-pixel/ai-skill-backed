@@ -224,6 +224,12 @@ export const localDb = {
   },
 
   // ATS Results
+  getAtsResult(resumeId: string) {
+    const db = readDb();
+    const found = db.atsResults.find(a => a.resumeId === resumeId);
+    return found || null;
+  },
+
   getLatestAtsResult(userId: string, resumeId?: string) {
     const db = readDb();
     const filtered = db.atsResults.filter(a => {
@@ -245,12 +251,21 @@ export const localDb = {
       resumeId: atsResult.resumeId,
       evaluatedRole: atsResult.evaluatedRole || '',
       score: atsResult.score,
+      universal_score: atsResult.universal_score || 71,
+      role_match_score: atsResult.role_match_score || atsResult.score || 0,
       market_match: atsResult.market_match || 0,
       label: atsResult.label,
       color: atsResult.color,
       breakdown: atsResult.breakdown || [],
       priority_fixes: Array.isArray(atsResult.priority_fixes) ? atsResult.priority_fixes : [],
       bullet_rewrites: Array.isArray(atsResult.bullet_rewrites) ? atsResult.bullet_rewrites : [],
+      matched_keywords: atsResult.matched_keywords || [],
+      missing_keywords: atsResult.missing_keywords || [],
+      section_audit: atsResult.section_audit || [],
+      grammar_audit: atsResult.grammar_audit || [],
+      repetition_audit: atsResult.repetition_audit || {},
+      suggested_roles: atsResult.suggested_roles || [],
+      auto_fixed_resume: atsResult.auto_fixed_resume || null,
       top_3_fixes: Array.isArray(finalFixes) ? (typeof finalFixes[0] === 'object' ? finalFixes.map((f: any) => f.fix || f.problem) : finalFixes) : [],
       createdAt: atsResult.createdAt || new Date().toISOString()
     };
