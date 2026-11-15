@@ -453,6 +453,32 @@ function getGeminiApiKeyPool(): string[] {
   return validKeys;
 }
 
+interface KeyUsageStats {
+  totalCalls: number;
+  successCalls: number;
+  rateLimitHits: number;
+  lastUsedTimestamp: number;
+  lastLatencyMs: number;
+}
+const keyUsageStatsMap = new Map<string, KeyUsageStats>();
+
+function trackKeyUsage(apiKey: string, success: boolean, isRateLimit: boolean, latencyMs: number) {
+  if (!apiKey) return;
+  const stats = keyUsageStatsMap.get(apiKey) || {
+    totalCalls: 0,
+    successCalls: 0,
+    rateLimitHits: 0,
+    lastUsedTimestamp: 0,
+    lastLatencyMs: 0
+  };
+  stats.totalCalls += 1;
+  if (success) stats.successCalls += 1;
+  if (isRateLimit) stats.rateLimitHits += 1;
+  stats.lastUsedTimestamp = Date.now();
+  stats.lastLatencyMs = latencyMs;
+  keyUsageStatsMap.set(apiKey, stats);
+}
+
 function getGeminiKeysStatus() {
   const pool = getGeminiApiKeyPool();
   const now = Date.now();
@@ -462,12 +488,31 @@ function getGeminiKeysStatus() {
     keys: pool.map((k, idx) => {
       const cooldown = keyCooldowns.get(k) || 0;
       const isCoolingDown = now < cooldown;
+      const stats = keyUsageStatsMap.get(k) || {
+        totalCalls: 0,
+        successCalls: 0,
+        rateLimitHits: 0,
+        lastUsedTimestamp: 0,
+        lastLatencyMs: 0
+      };
+      const lastUsedAgo = stats.lastUsedTimestamp > 0
+        ? `${Math.max(1, Math.round((now - stats.lastUsedTimestamp) / 1000))}s ago`
+        : "Standby (Not called yet)";
+      const successRate = stats.totalCalls > 0
+        ? `${Math.round((stats.successCalls / stats.totalCalls) * 100)}%`
+        : "100%";
       return {
         keyIndex: idx + 1,
         preview: k.length > 8 ? `${k.substring(0, 6)}...${k.slice(-4)}` : 'INVALID',
         length: k.length,
         status: isCoolingDown ? `cooldown (${Math.round((cooldown - now) / 1000)}s left)` : 'healthy',
-        isCurrentTarget: idx === (keyRotationIndex % Math.max(1, pool.length))
+        isCurrentTarget: idx === (keyRotationIndex % Math.max(1, pool.length)),
+        totalRequests: stats.totalCalls,
+        successfulRequests: stats.successCalls,
+        rateLimitHits: stats.rateLimitHits,
+        successRate,
+        lastLatencyMs: stats.lastLatencyMs,
+        lastUsed: lastUsedAgo
       };
     })
   };
@@ -587,6 +632,7 @@ async function generateContentReliably(options: {
     let rotateKeyImmediately = false;
 
     for (const currentModel of modelsToTry) {
+      const callStartTime = Date.now();
       try {
         console.log(`[server] [AI Attempt] Model: ${currentModel} (key: ${keyPreview}, timeout: ${timeoutMs}ms)`);
         
@@ -599,7 +645,9 @@ async function generateContentReliably(options: {
           setTimeout(() => reject(new Error(`AI Request Timeout after ${Math.round(timeoutMs / 1000)}s`)), timeoutMs)
         );
 
-        return await Promise.race([apiCall, timeoutPromise]);
+        const callResult = await Promise.race([apiCall, timeoutPromise]);
+        trackKeyUsage(key, true, false, Date.now() - callStartTime);
+        return callResult;
       } catch (error: any) {
         lastError = error;
         
@@ -618,6 +666,8 @@ async function generateContentReliably(options: {
                              errorDetails.includes("RESOURCE_EXHAUSTED") || 
                              errorDetails.includes("quota") ||
                              errorDetails.includes("rate limit");
+
+        trackKeyUsage(key, false, isQuotaError, Date.now() - callStartTime);
 
         const isPermissionError = errorDetails.includes("403") || 
                                   errorDetails.includes("PERMISSION_DENIED") || 
