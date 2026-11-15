@@ -3963,6 +3963,16 @@ Return ONLY valid JSON matching this exact structure:
       });
 
       const autoFixed = JSON.parse(cleanJSONResponse(aiResponse.text || "{}"));
+      const fixedText = autoFixed.formattedMarkdown || autoFixed.fixedResumeText || "";
+      const finalAutoFixed = {
+        ...autoFixed,
+        fixedResumeText: fixedText,
+        formattedMarkdown: fixedText,
+        changesSummary: autoFixed.improvementsSummary || autoFixed.changesSummary || [],
+        improvementsSummary: autoFixed.improvementsSummary || autoFixed.changesSummary || [],
+        fixesCount: autoFixed.fixesCount || autoFixed.changesCount || 8,
+        changesCount: autoFixed.fixesCount || autoFixed.changesCount || 8
+      };
 
       // If user is authenticated and resumeId is present, persist the auto-fixed resume into AtsResult
       if (uid && resumeId) {
@@ -3970,12 +3980,12 @@ Return ONLY valid JSON matching this exact structure:
           if (isMongoConnected()) {
             await AtsResult.updateOne(
               { userId: uid, resumeId },
-              { $set: { auto_fixed_resume: autoFixed } }
+              { $set: { auto_fixed_resume: finalAutoFixed } }
             );
           } else {
             const existingAts = localDb.getAtsResult(resumeId);
             if (existingAts) {
-              localDb.saveAtsResult({ ...existingAts, auto_fixed_resume: autoFixed });
+              localDb.saveAtsResult({ ...existingAts, auto_fixed_resume: finalAutoFixed });
             }
           }
         } catch (dbErr: any) {
@@ -3983,8 +3993,8 @@ Return ONLY valid JSON matching this exact structure:
         }
       }
 
-      console.log(`[server] [Resume Auto-Fix] Transformation complete. Fixes applied: ${autoFixed.fixesCount || 10}`);
-      res.json(autoFixed);
+      console.log(`[server] [Resume Auto-Fix] Transformation complete. Fixes applied: ${finalAutoFixed.fixesCount || 10}`);
+      res.json(finalAutoFixed);
     } catch (err: any) {
       console.error("[server] [Resume Auto-Fix] Error:", err.message || err);
       res.status(500).json({ error: "Failed to generate auto-fixed resume. Please try again." });
