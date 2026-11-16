@@ -3772,8 +3772,15 @@ async function startServer() {
   // 2b. Guest Scan Endpoint - 1-Click Free Instant Scan Without Sign-Up (High-Conversion Frictionless Entry)
   app.post("/api/resume/guest-scan", async (req, res) => {
     try {
-      const { text: rawText, base64, mimeType = "application/pdf", filename = "resume.pdf" } = req.body;
+      const { text: rawText, base64, mimeType: rawMime = "application/pdf", filename = "resume.pdf" } = req.body;
       let text = rawText || "";
+      let mimeType = rawMime || "application/pdf";
+      const ext = (filename.split('.').pop() || '').toLowerCase();
+      if (ext === 'pdf') mimeType = 'application/pdf';
+      else if (ext === 'docx' || ext === 'doc') mimeType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+      else if (['jpg', 'jpeg', 'png', 'webp'].includes(ext) || mimeType.startsWith('image/')) {
+        mimeType = (ext === 'png' || ext === 'webp') ? `image/${ext}` : 'image/jpeg';
+      }
 
       // If document base64 is provided directly from landing page dropzone, extract text fast
       if (!text && base64) {
@@ -3792,6 +3799,26 @@ async function startServer() {
           } catch (err: any) {
             console.warn("[guest-scan] Direct PDF parsing notice:", err.message);
           }
+
+          // If scanned PDF or non-digital PDF with minimal text, fallback to Gemini Vision OCR
+          if (!text || text.trim().length < 50) {
+            try {
+              console.log("[guest-scan] Digital parse yielded low text, attempting fast Vision OCR for PDF...");
+              const ocrRes = await generateContentReliably({
+                model: "gemini-3.1-flash-lite",
+                timeoutMs: 15000,
+                contents: [
+                  { inlineData: { data: base64, mimeType: 'application/pdf' } },
+                  { text: "Extract all text, sections, skills, work experience, and profile details from this resume PDF. Return clean readable text." }
+                ]
+              });
+              if (ocrRes.text && ocrRes.text.trim().length > 30) {
+                text = ocrRes.text.trim();
+              }
+            } catch (visionErr: any) {
+              console.warn("[guest-scan] PDF Vision OCR notice:", visionErr.message);
+            }
+          }
         } else if (mimeType.includes("word") || mimeType.includes("officedocument")) {
           try {
             const result = await mammoth.extractRawText({ buffer });
@@ -3799,11 +3826,26 @@ async function startServer() {
           } catch (err: any) {
             console.warn("[guest-scan] DOCX parsing notice:", err.message);
           }
+        } else if (mimeType.startsWith('image/')) {
+          try {
+            console.log("[guest-scan] Running fast Vision OCR for image scan:", filename);
+            const ocrRes = await generateContentReliably({
+              model: "gemini-3.1-flash-lite",
+              timeoutMs: 15000,
+              contents: [
+                { inlineData: { data: base64, mimeType: (mimeType === 'image/png' || mimeType === 'image/webp') ? mimeType : 'image/jpeg' } },
+                { text: "Extract all readable text, candidate name, job history, and skills from this resume photo. Return clean readable text." }
+              ]
+            });
+            text = (ocrRes.text || "").trim();
+          } catch (imgErr: any) {
+            console.warn("[guest-scan] Image Vision OCR error:", imgErr.message);
+          }
         }
       }
 
       if (!text || text.trim().length < 20) {
-        return res.status(400).json({ error: "Missing or unreadable resume content for guest scan." });
+        return res.status(400).json({ error: "Missing or unreadable resume content for guest scan. Please ensure your file has readable text or try another format." });
       }
 
       const telemetry = computeResumeTelemetry(text);
@@ -3842,6 +3884,7 @@ Return ONLY valid JSON matching this schema:
         const parsed = JSON.parse(cleanJSONResponse(aiResponse.text || "{}"));
         res.json({
           isGuest: true,
+          text: text,
           universal_score: universalScore,
           label: universalScore >= 80 ? "Top 5% Candidate" : universalScore >= 70 ? "Moderate Fit (Ready for Optimization)" : "Needs Optimization",
           color: universalScore >= 80 ? "emerald" : universalScore >= 70 ? "blue" : "amber",
@@ -3865,6 +3908,7 @@ Return ONLY valid JSON matching this schema:
         console.warn("[guest-scan] AI preview fallback to telemetry:", aiErr.message);
         res.json({
           isGuest: true,
+          text: text,
           universal_score: universalScore,
           label: "Moderate Fit (Ready for Optimization)",
           color: "blue",
